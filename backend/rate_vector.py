@@ -1,7 +1,7 @@
 """
 Build an hourly rate vector for a billing window from utility rate configuration.
 
-Fetches ``/v3.0/rates/configuration/utilityId/{utility_id}``, selects a plan by name,
+Fetches ``/v3.0/rates/configuration/utilityId/{utility_id}``, selects a plan by ``planNumber``,
 then assigns one **CONSUMPTION_BASED** marginal rate per clock hour in
 ``[bill_start_epoch, bill_end_epoch)`` (fixed and demand charges are ignored).
 """
@@ -120,6 +120,7 @@ def fetch_rate_configuration(
     }
     logger.info("Fetching rate configuration", extra={"utility_id": utility_id})
     resp = requests.get(url, headers=headers, timeout=timeout_s)
+    print(resp.text)
     resp.raise_for_status()
     data = resp.json()
     if isinstance(data, dict):
@@ -135,21 +136,36 @@ def fetch_rate_configuration(
     raise ValueError("Rate configuration response must be a JSON object with payload or a list")
 
 
-def select_plan_by_name(
+def _plan_number_matches(api_value: Any, requested: Any) -> bool:
+    """True if API planNumber matches CLI request (int 1 vs str '1', etc.)."""
+    if api_value is None:
+        return False
+    a = str(api_value).strip()
+    b = str(requested).strip()
+    if a == b:
+        return True
+    try:
+        return int(float(a)) == int(float(b))
+    except (TypeError, ValueError):
+        return False
+
+
+def select_plan_by_number(
     plans: Sequence[dict[str, Any]],
-    rate_plan: str,
+    plan_number: str | int,
 ) -> dict[str, Any]:
-    """Pick plan where ``planName`` matches (or string form of ``planNumber``)."""
-    target = str(rate_plan).strip()
+    """Pick plan where ``planNumber`` matches ``plan_number`` (string or int forms)."""
     for p in plans:
-        name = p.get("planName")
-        if name is not None and str(name).strip() == target:
-            return p
         num = p.get("planNumber")
-        if num is not None and str(num).strip() == target:
+        if _plan_number_matches(num, plan_number):
+            logger.info(
+                "Using rate plan planNumber=%s planName=%s",
+                num,
+                p.get("planName"),
+            )
             return p
-    names = [p.get("planName") for p in plans]
-    raise ValueError(f"No rate plan matching {rate_plan!r}. Available planName values: {names}")
+    numbers = [p.get("planNumber") for p in plans]
+    raise ValueError(f"No rate plan with planNumber matching {plan_number!r}. Available planNumber values: {numbers}")
 
 
 def _matches_calendar(rate: dict[str, Any], dt: datetime) -> bool:
@@ -225,7 +241,7 @@ def _iter_hour_starts(
 
 
 def create_rate_vector(
-    rate_plan: str,
+    rate_plan: str | int,
     bill_start_epoch: int,
     bill_end_epoch: int,
     *,
@@ -236,8 +252,11 @@ def create_rate_vector(
     access_token: str | None = None,
 ) -> list[float]:
     """
-    Fetch utility rates, select ``rate_plan`` (``planName`` or ``planNumber`` string),
+    Fetch utility rates, select ``rate_plan`` by ``planNumber`` (string or int),
     and return one **CONSUMPTION_BASED** marginal rate per clock hour.
+
+    If the plan has multiple components with consumption rates, only the **first**
+    such component (API order) is used for each hour; rates are **not** summed.
 
     ``MONTHLY_FIXED``, ``MONTHLY_DEMAND_BASED``, and any other charge types are
     omitted from the vector.
@@ -279,7 +298,7 @@ def create_rate_vector(
 
 
 def create_rate_vector_from_cached_plans(
-    rate_plan: str,
+    rate_plan: str | int,
     bill_start_epoch: int,
     bill_end_epoch: int,
     plans: Sequence[dict[str, Any]],
@@ -287,8 +306,11 @@ def create_rate_vector_from_cached_plans(
     timezone: str = "UTC",
     hourly_kwh: Sequence[float] | None = None,
 ) -> list[float]:
-    """Same as :func:`create_rate_vector` but uses an already-fetched plan list (tests/offline)."""
-    plan = select_plan_by_name(plans, rate_plan)
+    """Same as :func:`create_rate_vector` but uses an already-fetched plan list (tests/offline).
+
+    Uses the first plan component (API order) that has a matching consumption rate per hour.
+    """
+    plan = select_plan_by_number(plans, rate_plan)
     try:
         tz = ZoneInfo(timezone)
     except Exception as e:  # noqa: BLE001
@@ -324,7 +346,8 @@ def create_rate_vector_from_cached_plans(
                 and _matches_valid_window(r, hour_epoch)
             ]
             if consumption_candidates:
-                hour_total += _pick_consumption_rate(consumption_candidates, cumulative_kwh)
+                hour_total = _pick_consumption_rate(consumption_candidates, cumulative_kwh)
+                break
 
         vector.append(hour_total)
         if hourly_kwh is not None:
@@ -349,7 +372,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     p = argparse.ArgumentParser(description="Build hourly consumption rate vector from API.")
-    p.add_argument("--plan", default="011ID", help="planName or planNumber (default: 011ID)")
+    p.add_argument("--plan", default=1, help="planNumber (default: 1)")
     p.add_argument(
         "--timezone",
         default="UTC",
@@ -358,7 +381,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument(
         "--month",
         metavar="YYYY-MM",
-        help="Bill calendar month in --timezone (default: current month)",
+        help="Bill calendar month in --timezone (default: April of current year)",
     )
     p.add_argument(
         "--start",
@@ -403,7 +426,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         start_e, end_e = _month_bounds_epoch(y, m, tz)
     else:
         now = datetime.now(tz)
-        start_e, end_e = _month_bounds_epoch(now.year, now.month, tz)
+        start_e, end_e = _month_bounds_epoch(now.year, 4, tz)
 
     try:
         vec = create_rate_vector(
@@ -425,10 +448,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"epoch range: {start_e} .. {end_e} (end exclusive)")
     print(f"hours: {len(vec)}")
     if vec:
-        head = [round(x, 6) for x in vec[:12]]
-        tail = [round(x, 6) for x in vec[-12:]]
-        print(f"first 12: {head}")
-        print(f"last 12: {tail}")
+        head = [round(x, 6) for x in vec[:24]]
+        tail = [round(x, 6) for x in vec[-24:]]
+        print(f"first 24 hours: {head}")
+        print(f"last 24 hours: {tail}")
         print(f"min / max: {min(vec):.6f} / {max(vec):.6f}")
     return 0
 

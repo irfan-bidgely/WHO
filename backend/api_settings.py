@@ -5,10 +5,10 @@ No environment variables are used for these values.
 """
 
 # e.g. "https://api.example.com" (no trailing slash required)
-API_BASE_URL = "https://api-server-hyphen-dev.bidgely.com"
+API_BASE_URL = "https://naapi.bidgely.com"
 
 # Bearer token for the rates API
-ACCESS_TOKEN = "8e03e188-a581-449f-9985-6b9ec92390e5"
+ACCESS_TOKEN = "dc09a290-da5c-48bb-8fd9-149b8ec20608"
 
 # Utility id in the rates path: .../utilityId/{UTILITY_ID}
-UTILITY_ID = 54631
+UTILITY_ID = 10121
