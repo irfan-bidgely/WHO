@@ -1,0 +1,50 @@
+---
+description: Code quality and logging standards for Python backend and TypeScript frontend
+alwaysApply: true
+---
+
+# Code and logging
+
+## General code
+
+- Prefer small, single-purpose functions and modules. Name things after behavior or domain, not implementation details.
+- Keep public APIs explicit: typed boundaries (TypeScript types, Python type hints), avoid `any` / untyped `dict` at module edges.
+- Handle errors at boundaries: validate inputs, map failures to clear messages; avoid empty `except` / `catch`.
+- Do not log secrets, tokens, passwords, or full PII. Redact or hash identifiers when logs must reference users.
+- Match existing project style (imports, formatting, patterns) before introducing new conventions.
+
+## Python (Flask / backend)
+
+- Use the standard `logging` module, not `print`, for runtime diagnostics. Get a logger per module: `logger = logging.getLogger(__name__)`.
+- Use levels intentionally: `DEBUG` for verbose traces, `INFO` for normal lifecycle, `WARNING` for recoverable issues, `ERROR` for failures that need attention.
+- Include context in log messages (request id, operation name) when it helps debugging; keep messages structured and grep-friendly.
+- Configure logging once at app startup (`basicConfig` or dict config), not inside hot paths.
+
+## TypeScript / React (frontend)
+
+- Prefer typed Redux hooks (`useAppDispatch`, `useAppSelector`) and RTK slices over ad hoc global state.
+- Avoid `console.log` in committed code except short-lived debugging; remove before merge. Use meaningful user-facing or telemetry patterns only where the product requires them.
+- Components: keep presentation separate from data fetching where it improves testability; use semantic HTML and accessible labels where applicable.
+
+## Examples
+
+```python
+# Avoid
+print("error", e)
+
+# Prefer
+logger.exception("payment webhook failed", extra={"event_id": event_id})
+```
+
+```typescript
+// Avoid
+catch (e) {}
+
+// Prefer
+catch (e) {
+  console.error('Failed to load', e);
+  throw e;
+}
+```
+
+(Use `console.error` sparingly in production paths; prefer user feedback or a shared error boundary strategy when the project adds one.)
