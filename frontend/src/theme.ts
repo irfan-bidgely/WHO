@@ -10,6 +10,6 @@ export const appTheme = createTheme({
   palette: {
     mode: 'light',
     primary: { main: '#0d47a1' },
-    background: { default: '#f5f5f7' },
+    background: { default: '#f6f8fb' },
   },
 });

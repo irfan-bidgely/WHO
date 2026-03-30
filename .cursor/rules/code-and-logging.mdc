@@ -25,7 +25,7 @@ alwaysApply: true
 - Prefer typed Redux hooks (`useAppDispatch`, `useAppSelector`) and RTK slices over ad hoc global state.
 - Avoid `console.log` in committed code except short-lived debugging; remove before merge. Use meaningful user-facing or telemetry patterns only where the product requires them.
 - Components: keep presentation separate from data fetching where it improves testability; use semantic HTML and accessible labels where applicable.
-
+- Also maintain keys for necessary items to avoid any warnings or leakges
 ## Examples
 
 ```python

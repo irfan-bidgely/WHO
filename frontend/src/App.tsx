@@ -3,7 +3,7 @@ import { WhoWidget } from './components/WhoWidget';
 
 function App() {
   return (
-    <Container maxWidth="md" sx={{ py: 2 }}>
+    <Container maxWidth="xl" sx={{ py: { xs: 2, md: 4 } }}>
       <WhoWidget />
     </Container>
   );
