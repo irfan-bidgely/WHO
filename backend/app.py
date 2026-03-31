@@ -27,6 +27,25 @@ SHIFTABLE_APPLIANCE_IDS = [18, 2, 3, 4, 7, 30]
 app.json.sort_keys = False
 
 
+def _load_backend_dotenv() -> None:
+    """Load key/value pairs from backend/.env when running python app.py directly."""
+    env_path = Path(__file__).with_name(".env")
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", maxsplit=1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_backend_dotenv()
+
+
 def _load_appliance_catalog() -> dict[int, str]:
     mapping_path = Path(__file__).with_name("appliance_mapping.json")
     raw = mapping_path.read_text(encoding="utf-8")

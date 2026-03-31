@@ -1,4 +1,4 @@
-import { useId, useMemo, useState } from 'react';
+import { useEffect, useId, useMemo, useState } from 'react';
 import Card from '@mui/material/Card';
 import CardContent from '@mui/material/CardContent';
 import Box from '@mui/material/Box';
@@ -9,10 +9,13 @@ import Stack from '@mui/material/Stack';
 import TextField from '@mui/material/TextField';
 import Typography from '@mui/material/Typography';
 import { analyzeConstraint } from '../features/who/analyzeConstraintApi';
+import { fetchBuildMergedOptimize } from '../features/who/buildMergedOptimizeApi';
 import { applyConstraintWindow, type TimelineApplianceId } from '../features/who/whoSlice';
 import { useAppDispatch, useAppSelector } from '../store/hooks';
 import { HourScale } from './HourScale';
 import { TimelineRangeBar } from './TimelineRangeBar';
+
+const DEFAULT_OPTIMIZER_UUID = '9d1df24f-f902-45ac-b3f4-a711dd57c0a5';
 
 /**
  * Primary SPA surface: WHO content and state wired through Redux Toolkit.
@@ -25,8 +28,15 @@ export function WhoWidget() {
   const [lifestyleInput, setLifestyleInput] = useState('');
   const [analysisInputMode, setAnalysisInputMode] = useState<'text' | 'sliders'>('text');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [isGraphLoading, setIsGraphLoading] = useState(true);
+  const [graphErrorMessage, setGraphErrorMessage] = useState<string | null>(null);
   const [analysisSuccessMessage, setAnalysisSuccessMessage] = useState<string | null>(null);
   const [analysisErrorMessage, setAnalysisErrorMessage] = useState<string | null>(null);
+  const [optimizeData, setOptimizeData] = useState<{
+    totalCurrentCost: number;
+    totalBestCost: number;
+    appliances: Array<{ appId: number; name: string; currentCost: number; bestCost: number; costSavings: number }>;
+  } | null>(null);
   const applianceIdToTimelineId: Record<number, TimelineApplianceId | undefined> = {
     18: 'ev',
     4: 'ac',
@@ -99,22 +109,114 @@ export function WhoWidget() {
     }
   };
 
+  useEffect(() => {
+    let cancelled = false;
+    const loadGraphData = async () => {
+      setIsGraphLoading(true);
+      setGraphErrorMessage(null);
+      try {
+        const uuid =
+          (import.meta.env.VITE_OPTIMIZER_UUID as string | undefined)?.trim() || DEFAULT_OPTIMIZER_UUID;
+        const userUuid = (import.meta.env.VITE_OPTIMIZER_USER_UUID as string | undefined)?.trim() ?? '';
+        const timezone = (import.meta.env.VITE_OPTIMIZER_TIMEZONE as string | undefined)?.trim() ?? 'UTC';
+        const result = await fetchBuildMergedOptimize({
+          uuid,
+          userUuid: userUuid || undefined,
+          timezone,
+        });
+        if (cancelled) return;
+        setOptimizeData({
+          totalCurrentCost: result.total.current.cost,
+          totalBestCost: result.total.best.cost,
+          appliances: result.appliances.map((appliance) => ({
+            appId: appliance.appId,
+            name: appliance.name,
+            currentCost: appliance.current.cost,
+            bestCost: appliance.best.cost,
+            costSavings: appliance.savings.costSavings,
+          })),
+        });
+      } catch {
+        if (cancelled) return;
+        setGraphErrorMessage('Unable to load optimization graph data.');
+      } finally {
+        if (!cancelled) setIsGraphLoading(false);
+      }
+    };
+
+    void loadGraphData();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const chartData = useMemo(
-    () => [
-      { label: 'AC', actual: 100, optimized: 70 },
-      { label: 'EV', actual: 120, optimized: 80 },
-      { label: 'Laundry', actual: 60, optimized: 40 },
-    ],
-    [],
+    () => {
+      const mapped =
+        optimizeData?.appliances
+          .map((appliance) => ({
+            label: appliance.name.replaceAll('_', ' '),
+            actualCost: appliance.currentCost,
+            optimizedCost: appliance.bestCost,
+          }))
+          .sort(
+            (a, b) =>
+              Math.max(b.actualCost, b.optimizedCost) - Math.max(a.actualCost, a.optimizedCost),
+          )
+          .slice(0, 5) ?? [];
+      const maxCost = Math.max(1, ...mapped.map((item) => Math.max(item.actualCost, item.optimizedCost)));
+      const maxBarHeight = 160;
+      return mapped.map((item) => ({
+        label: item.label,
+        actual:
+          item.actualCost > 0
+            ? Math.max(6, (item.actualCost / maxCost) * maxBarHeight)
+            : 0,
+        optimized:
+          item.optimizedCost > 0
+            ? Math.max(6, (item.optimizedCost / maxCost) * maxBarHeight)
+            : 0,
+        actualCost: item.actualCost,
+        optimizedCost: item.optimizedCost,
+      }));
+    },
+    [optimizeData],
   );
 
   const insights = useMemo(
-    () => [
-      { title: '⚡ EV Optimization', value: 'Save ₹70/day', color: '#2e7d32' },
-      { title: '❄️ AC Usage', value: 'Peak overlap', color: '#ef6c00' },
-      { title: '🧺 Laundry', value: 'Easy to shift', color: '#6a1b9a' },
-    ],
-    [],
+    () => {
+      if (!optimizeData) {
+        return [
+          { title: 'Optimization', value: 'Loading...', color: '#2e7d32' },
+          { title: 'Cost', value: 'Loading...', color: '#ef6c00' },
+          { title: 'Appliances', value: 'Loading...', color: '#6a1b9a' },
+        ];
+      }
+      const topSavings = [...optimizeData.appliances]
+        .sort((a, b) => b.costSavings - a.costSavings)
+        .slice(0, 3);
+      const first = topSavings[0];
+      const second = topSavings[1];
+      const third = topSavings[2];
+      return [
+        {
+          title: `Top Saver: ${first?.name?.replaceAll('_', ' ') ?? 'N/A'}`,
+          value: `Save Rs ${Number(first?.costSavings ?? 0).toFixed(2)}`,
+          color: '#2e7d32',
+        },
+        {
+          title: 'Total Current vs Best',
+          value: `Rs ${optimizeData.totalCurrentCost.toFixed(2)} -> Rs ${optimizeData.totalBestCost.toFixed(2)}`,
+          color: '#ef6c00',
+        },
+        {
+          title: `Next: ${second?.name?.replaceAll('_', ' ') ?? third?.name?.replaceAll('_', ' ') ?? 'N/A'}`,
+          value: `Save Rs ${Number((second ?? third)?.costSavings ?? 0).toFixed(2)}`,
+          color: '#6a1b9a',
+        },
+      ];
+    },
+    [optimizeData],
   );
 
   return (
@@ -157,6 +259,9 @@ export function WhoWidget() {
                       <Typography variant="caption" color="text.secondary">
                         {item.label}
                       </Typography>
+                      <Typography variant="caption" color="text.secondary">
+                        Rs {item.actualCost.toFixed(2)} {'->'} Rs {item.optimizedCost.toFixed(2)}
+                      </Typography>
                     </Stack>
                   ))}
                 </Stack>
@@ -177,6 +282,16 @@ export function WhoWidget() {
                 </Stack>
               </Stack>
             </Stack>
+            {isGraphLoading ? (
+              <Typography variant="caption" color="text.secondary">
+                Loading graph data...
+              </Typography>
+            ) : null}
+            {graphErrorMessage ? (
+              <Typography variant="caption" color="error.main">
+                {graphErrorMessage}
+              </Typography>
+            ) : null}
           </CardContent>
         </Card>
 
