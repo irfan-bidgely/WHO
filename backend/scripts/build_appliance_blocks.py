@@ -19,6 +19,7 @@ import argparse
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 
 DEFAULT_SHIFTABLE = [18, 2, 3, 4, 7]
@@ -52,6 +53,8 @@ def linear_start_t(bill_anchor_ts: int, interval_start_ts: int) -> int:
 def merge_blocks(
     intervals: list[dict],
     bill_anchor_ts: int,
+    *,
+    value_scale: float = 1.0,
 ) -> list[dict]:
     """Return list of {start_t, duration, consumption: [...]}."""
     if not intervals:
@@ -60,7 +63,7 @@ def merge_blocks(
     sorted_iv = sorted(intervals, key=lambda x: int(x["start"]))
     blocks: list[dict] = []
     cur_values: list[float] = []
-    cur_start_t: int | None = None
+    cur_start_t: Optional[int] = None
 
     def flush() -> None:
         nonlocal cur_values, cur_start_t
@@ -79,7 +82,7 @@ def merge_blocks(
     for inv in sorted_iv:
         s = int(inv["start"])
         e = int(inv["end"])
-        v = float(inv["value"])
+        v = float(inv["value"]) * float(value_scale)
 
         st = linear_start_t(bill_anchor_ts, s)
         s_date = interval_start_date_utc(s)
@@ -113,6 +116,8 @@ def build_document(
     tb_path: Path,
     mapping_path: Path,
     shiftable_ids: set[int],
+    *,
+    value_scale: float = 1.0,
 ) -> dict:
     tb = json.loads(tb_path.read_text(encoding="utf-8"))
     mapping = load_mapping(mapping_path)
@@ -125,7 +130,7 @@ def build_document(
         intervals = app.get("intervals") or []
         bill_anchor = int(app.get("start") or min(int(i["start"]) for i in intervals))
 
-        blocks_raw = merge_blocks(intervals, bill_anchor)
+        blocks_raw = merge_blocks(intervals, bill_anchor, value_scale=value_scale)
         blocks = []
         for i, b in enumerate(blocks_raw, start=1):
             blocks.append(
@@ -179,11 +184,17 @@ def main() -> None:
         default=",".join(str(x) for x in DEFAULT_SHIFTABLE),
         help="Comma-separated appIds that are shiftable (default: 18,2,3,4,7)",
     )
+    p.add_argument(
+        "--value-scale",
+        type=float,
+        default=1.0,
+        help="Multiply each tbValues entry by this scale (e.g. 0.001 to convert Wh->kWh).",
+    )
     args = p.parse_args()
 
     shiftable_ids = {int(x.strip()) for x in args.shiftable.split(",") if x.strip()}
 
-    doc = build_document(args.tbdata, args.mapping, shiftable_ids)
+    doc = build_document(args.tbdata, args.mapping, shiftable_ids, value_scale=args.value_scale)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     n_apps = len(doc["appliances"])

@@ -13,7 +13,7 @@ import json
 import logging
 import sys
 from datetime import datetime, timedelta, timezone as dt_timezone
-from typing import Any, Sequence
+from typing import Any, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 import requests
@@ -28,7 +28,7 @@ CHARGE_CONSUMPTION = "CONSUMPTION_BASED"
 _VALID_SENTINEL_PREFIX = "1970-01-01"
 
 
-def _epoch_to_seconds(value: Any) -> int | None:
+def _epoch_to_seconds(value: Any) -> Optional[int]:
     if value is None:
         return None
     try:
@@ -69,7 +69,7 @@ def _date_string_end_inclusive_utc(s: str) -> int:
     return int(nxt.timestamp()) - 1
 
 
-def _valid_inclusive_epoch_bounds(rate: dict[str, Any]) -> tuple[int | None, int | None]:
+def _valid_inclusive_epoch_bounds(rate: dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
     """
     Return (low, high) epoch seconds inclusive, or (None, None) if unrestricted.
     Supports numeric epochs and ``YYYY-MM-DD`` strings.
@@ -79,8 +79,8 @@ def _valid_inclusive_epoch_bounds(rate: dict[str, Any]) -> tuple[int | None, int
     if _is_open_valid_window(lo_raw, hi_raw):
         return None, None
 
-    lo: int | None = None
-    hi: int | None = None
+    lo: Optional[int] = None
+    hi: Optional[int] = None
 
     if isinstance(lo_raw, str) and len(lo_raw.strip()) >= 10:
         try:
@@ -245,11 +245,11 @@ def create_rate_vector(
     bill_start_epoch: int,
     bill_end_epoch: int,
     *,
-    api_host: str | None = None,
-    utility_id: int | None = None,
+    api_host: Optional[str] = None,
+    utility_id: Optional[int] = None,
     timezone: str = "UTC",
-    hourly_kwh: Sequence[float] | None = None,
-    access_token: str | None = None,
+    hourly_kwh: Optional[Sequence[float]] = None,
+    access_token: Optional[str] = None,
 ) -> list[float]:
     """
     Fetch utility rates, select ``rate_plan`` by ``planNumber`` (string or int),
@@ -304,7 +304,7 @@ def create_rate_vector_from_cached_plans(
     plans: Sequence[dict[str, Any]],
     *,
     timezone: str = "UTC",
-    hourly_kwh: Sequence[float] | None = None,
+    hourly_kwh: Optional[Sequence[float]] = None,
 ) -> list[float]:
     """Same as :func:`create_rate_vector` but uses an already-fetched plan list (tests/offline).
 
@@ -365,7 +365,7 @@ def _month_bounds_epoch(year: int, month: int, tz: ZoneInfo) -> tuple[int, int]:
     return int(first.timestamp()), int(nxt.timestamp())
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Optional[Sequence[str]] = None) -> int:
     """CLI: fetch rates and print hourly CONSUMPTION_BASED vector for a billing window."""
     logging.basicConfig(
         level=logging.INFO,

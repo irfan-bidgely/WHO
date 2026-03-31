@@ -18,7 +18,7 @@ import argparse
 import json
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 
 STATIC_METADATA: dict[str, Any] = {
@@ -57,7 +57,7 @@ def attach_constraints(appliances: list[dict], max_shift_hours: int) -> list[dic
     return out
 
 
-def fit_rate_vector(vec: list[float], target_slots: int | None) -> list[float]:
+def fit_rate_vector(vec: list[float], target_slots: Optional[int]) -> list[float]:
     if target_slots is None or target_slots <= 0:
         return vec
     if len(vec) == target_slots:
@@ -75,8 +75,8 @@ def merge(
     rates_path: Path,
     appliances_path: Path,
     max_shift_hours: int = 10,
-    start_time_override: int | None = None,
-    total_time_slots: int | None = 0,
+    start_time_override: Optional[int] = None,
+    total_time_slots: Optional[int] = 0,
 ) -> dict:
     rate_vector = fit_rate_vector(load_rate_vector(rates_path), total_time_slots if total_time_slots else None)
     appliances = attach_constraints(load_appliances(appliances_path), max_shift_hours)

@@ -53,7 +53,12 @@ def fetch_latest_bill_cycle_from_usage_chart(user_uuid: str, cfg: DashboardUsage
         "show-at-granularity": "false",
         "skip-ongoing-cycle": "false",
     }
-    headers = {"Authorization": f"Bearer {cfg.access_token}", "Accept": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {cfg.access_token}",
+        "Accept": "application/json",
+        "X-Bidgely-Client-Type": "WIDGETS",
+        "X-Bidgely-Pilot-Id": str(api_settings.UTILITY_ID),
+    }
     resp = requests.get(url, headers=headers, params=params, timeout=60)
     if resp.status_code >= 400:
         raise RuntimeError(
@@ -84,6 +89,51 @@ def fetch_latest_bill_cycle_from_usage_chart(user_uuid: str, cfg: DashboardUsage
     if not candidates:
         raise RuntimeError("No intervalStart with itemizationDetailsList != null in dashboard response")
     return max(candidates, key=lambda t: t[0])
+
+
+def fetch_latest_bill_cycle_row_from_usage_chart(user_uuid: str, cfg: DashboardUsageConfig) -> dict[str, Any]:
+    """
+    Like fetch_latest_bill_cycle_from_usage_chart, but returns the full row dict
+    (the one with max intervalStart where itemizationDetailsList != null).
+    """
+    url = f"{cfg.api_base_url.rstrip('/')}/v2.0/dashboard/users/{user_uuid}/usage-chart-details"
+    params = {
+        "measurement-type": "ELECTRIC",
+        "mode": "year",
+        "start": 0,
+        "end": 1774946470,
+        "date-format": "DATE_TIME",
+        "locale": "en_US",
+        "next-bill-cycle": "false",
+        "show-at-granularity": "false",
+        "skip-ongoing-cycle": "false",
+    }
+    headers = {
+        "Authorization": f"Bearer {cfg.access_token}",
+        "Accept": "application/json",
+        "X-Bidgely-Client-Type": "WIDGETS",
+        "X-Bidgely-Pilot-Id": str(api_settings.UTILITY_ID),
+    }
+    resp = requests.get(url, headers=headers, params=params, timeout=60)
+    if resp.status_code >= 400:
+        raise RuntimeError(
+            f"Dashboard API failed: HTTP {resp.status_code} url={resp.url} body={resp.text[:2000]!r}"
+        )
+    data = resp.json()
+    payload = data.get("payload") or {}
+    rows = payload.get("usageChartDataList") or []
+    candidates: list[dict[str, Any]] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        if r.get("itemizationDetailsList") is None:
+            continue
+        if r.get("intervalStart") is None:
+            continue
+        candidates.append(r)
+    if not candidates:
+        raise RuntimeError("No bill-cycle rows with itemizationDetailsList != null in dashboard response")
+    return max(candidates, key=lambda rr: int(float(rr.get("intervalStart") or 0)))
 
 
 def _s3_client():
@@ -165,6 +215,21 @@ def build_merged_for_uuid(
     s3_key = find_latest_dataset_key(uuid, bc_start)
     tbdata = download_s3_json(s3_key)
     (out_dir / "tbdata.json").write_text(json.dumps(tbdata, indent=2) + "\n", encoding="utf-8")
+    (out_dir / "tbdata_s3_source.json").write_text(
+        json.dumps(
+            {
+                "bucket": WAREHOUSE_BUCKET,
+                "key": s3_key,
+                "uuid": uuid,
+                "userUuid": dashboard_user_uuid,
+                "bc_start": bc_start,
+                "bc_end_exclusive": bc_end,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     tb_by_app = transform_tbdata(tbdata)
     tb_by_app_path = out_dir / "tbdata_by_app.json"
@@ -172,7 +237,8 @@ def build_merged_for_uuid(
 
     # Blocks
     mapping_path = out_dir.parent / "appliance_mapping.json"
-    blocks_doc = build_appliance_blocks(tb_by_app_path, mapping_path, shiftable_ids)
+    # S3 tbValues are typically in Wh. Optimizer + rates are per-kWh, so emit kWh.
+    blocks_doc = build_appliance_blocks(tb_by_app_path, mapping_path, shiftable_ids, value_scale=0.001)
     blocks_path = out_dir / "appliance_blocks.json"
     blocks_path.write_text(json.dumps(blocks_doc, indent=2) + "\n", encoding="utf-8")
 
