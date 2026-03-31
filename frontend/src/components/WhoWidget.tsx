@@ -21,28 +21,61 @@ export function WhoWidget() {
   const titleId = useId();
   const dispatch = useAppDispatch();
   const title = useAppSelector((s) => s.who.title);
+  const timeline = useAppSelector((s) => s.who.timeline);
   const [lifestyleInput, setLifestyleInput] = useState('');
+  const [analysisInputMode, setAnalysisInputMode] = useState<'text' | 'sliders'>('text');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisSuccessMessage, setAnalysisSuccessMessage] = useState<string | null>(null);
   const [analysisErrorMessage, setAnalysisErrorMessage] = useState<string | null>(null);
   const applianceIdToTimelineId: Record<number, TimelineApplianceId | undefined> = {
     18: 'ev',
     4: 'ac',
+    30: 'laundry',
+  };
+  const timelineIdToApplianceId: Record<TimelineApplianceId, number> = {
+    ev: 18,
+    ac: 4,
+    laundry: 30,
+  };
+
+  const pctToTimeString = (pct: number): string => {
+    const totalMinutes = Math.round((pct / 100) * 24 * 60);
+    if (totalMinutes >= 24 * 60) {
+      return '24:00';
+    }
+    const normalized = ((totalMinutes % (24 * 60)) + 24 * 60) % (24 * 60);
+    const hh = Math.floor(normalized / 60)
+      .toString()
+      .padStart(2, '0');
+    const mm = (normalized % 60).toString().padStart(2, '0');
+    return `${hh}:${mm}`;
   };
 
   const handleAnalyzeConstraints = async () => {
-    if (!lifestyleInput.trim()) {
+    const trimmedText = lifestyleInput.trim();
+    const sliderConstraints = (Object.entries(timeline) as Array<[TimelineApplianceId, typeof timeline.ev]>).map(
+      ([timelineId, range]) => ({
+        appliance_id: timelineIdToApplianceId[timelineId],
+        load_start_time: pctToTimeString(range.startPct),
+        load_end_time: pctToTimeString(range.endPct),
+      }),
+    );
+
+    if (analysisInputMode === 'text' && !trimmedText) {
       setAnalysisSuccessMessage(null);
       setAnalysisErrorMessage('Please enter a constraint first.');
       return;
     }
+
     setIsAnalyzing(true);
     setAnalysisSuccessMessage(null);
     setAnalysisErrorMessage(null);
     try {
-      const result = await analyzeConstraint({
-        constraintText: lifestyleInput.trim(),
-      });
+      const result = await analyzeConstraint(
+        analysisInputMode === 'text'
+          ? { constraintText: trimmedText }
+          : { constraints: sliderConstraints },
+      );
 
       let appliedCount = 0;
       for (const appliance of result.applianceConstraints) {
@@ -55,7 +88,7 @@ export function WhoWidget() {
       }
 
       if (appliedCount === 0) {
-        setAnalysisErrorMessage('No allowed window found in the text.');
+        setAnalysisErrorMessage('No allowed window found in the analyzed constraints.');
       } else {
         setAnalysisSuccessMessage(`Applied constraints to ${appliedCount} appliance(s).`);
       }
@@ -201,6 +234,22 @@ export function WhoWidget() {
               <Typography variant="h6" color="text.primary">
                 🧠 Tell us your lifestyle
               </Typography>
+              <Stack direction="row" spacing={1}>
+                <Button
+                  type="button"
+                  variant={analysisInputMode === 'text' ? 'contained' : 'outlined'}
+                  onClick={() => setAnalysisInputMode('text')}
+                >
+                  Analyze Text
+                </Button>
+                <Button
+                  type="button"
+                  variant={analysisInputMode === 'sliders' ? 'contained' : 'outlined'}
+                  onClick={() => setAnalysisInputMode('sliders')}
+                >
+                  Analyze Sliders
+                </Button>
+              </Stack>
 
               <Box
                 sx={{
@@ -213,6 +262,7 @@ export function WhoWidget() {
                 <TextField
                   value={lifestyleInput}
                   onChange={(event) => setLifestyleInput(event.target.value)}
+                  disabled={analysisInputMode !== 'text'}
                   fullWidth
                   multiline
                   minRows={2}
@@ -224,7 +274,9 @@ export function WhoWidget() {
 
               <Stack direction="row" justifyContent="space-between" alignItems="center">
                 <Typography variant="caption" color="text.secondary">
-                  Understands natural language • No rules needed
+                  {analysisInputMode === 'text'
+                    ? 'Analyzing only free text input'
+                    : 'Analyzing only slider constraints'}
                 </Typography>
                 <Button
                   type="button"
