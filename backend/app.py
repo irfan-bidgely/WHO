@@ -3,6 +3,7 @@ import logging
 import os
 from copy import deepcopy
 from pathlib import Path
+import concurrent.futures
 
 from dotenv import load_dotenv
 from typing import Optional, Tuple
@@ -255,6 +256,15 @@ def build_merged_optimize():
     uuid = (body.get("uuid") or "").strip()
     user_uuid = (body.get("userUuid") or "").strip() or None
     timezone = (body.get("timezone") or "UTC").strip()
+
+    # Optional: rate plan selector (defaults to 1, must be positive int)
+    try:
+        rate_plan = int(body.get("ratePlan", 1))
+    except Exception:
+        rate_plan = 1
+    if rate_plan <= 0:
+        rate_plan = 1
+
     if not uuid:
         return {"error": "uuid is required"}, 400
 
@@ -271,6 +281,7 @@ def build_merged_optimize():
             out_dir=Path(__file__).resolve().parent / "docs",
             shiftable_ids=set(SHIFTABLE_APPLIANCE_IDS),
             timezone=timezone,
+            rate_plan=rate_plan,
         )
     except Exception as e:  # noqa: BLE001
         logger.exception("build_merged_optimize: build_merged_for_uuid failed")
@@ -435,8 +446,16 @@ def build_merged_optimize():
         return data if isinstance(data, dict) else {"raw": data}
 
     try:
-        opt_json_baseline = _call_optimizer(merged)
-        opt_json_constrained = _call_optimizer(merged_constrained) if merged_constrained else None
+        # Run baseline + constrained optimizer calls in parallel when both are present
+        if merged_constrained:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                fut_baseline = executor.submit(_call_optimizer, merged)
+                fut_constrained = executor.submit(_call_optimizer, merged_constrained)
+                opt_json_baseline = fut_baseline.result()
+                opt_json_constrained = fut_constrained.result()
+        else:
+            opt_json_baseline = _call_optimizer(merged)
+            opt_json_constrained = None
     except requests.HTTPError as e:
         logger.exception("build_merged_optimize: optimizer HTTP error")
         detail = ""
