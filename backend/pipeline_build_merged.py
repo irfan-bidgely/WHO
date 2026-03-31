@@ -204,6 +204,7 @@ def build_merged_for_uuid(
     out_dir: Path,
     shiftable_ids: set[int],
     timezone: str = "UTC",
+    rate_plan: int = 1,
 ) -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -242,12 +243,12 @@ def build_merged_for_uuid(
     blocks_path = out_dir / "appliance_blocks.json"
     blocks_path.write_text(json.dumps(blocks_doc, indent=2) + "\n", encoding="utf-8")
 
-    # Rate vector (plan 1)
+    # Rate vector (selected plan)
     if bc_end is None or bc_end <= bc_start:
         ends = [int(v.get("end") or 0) for v in tb_by_app.values()]
         bc_end = max(ends) if ends else bc_start
-    rate_vec = create_rate_vector(1, bc_start, bc_end, timezone=timezone)
-    rates_path = out_dir / f"rate_vector_plan1_{bc_start}_{bc_end}.json"
+    rate_vec = create_rate_vector(rate_plan, bc_start, bc_end, timezone=timezone)
+    rates_path = out_dir / f"rate_vector_plan{rate_plan}_{bc_start}_{bc_end}.json"
     rates_path.write_text(json.dumps({"rateVector": rate_vec}, indent=2) + "\n", encoding="utf-8")
 
     # Merge (pad rateVector so totalTimeSlots covers all blocks)
