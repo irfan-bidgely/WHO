@@ -1,0 +1,8 @@
+{
+  "bucket": "bidgely-data-warehouse-prod-na",
+  "key": "tou-appliance-aggregation/hour-aggregated-appliance-data/v1/datasets/pilot_id=10121/uuid=9d1df24f-f902-45ac-b3f4-a711dd57c0a5/bc_start=1770274800/last_updated_timestamp=1773244820368/part-00005-ac2b7f70-3545-4377-86c5-f9fb1bc6f788.c000.json",
+  "uuid": "9d1df24f-f902-45ac-b3f4-a711dd57c0a5",
+  "userUuid": "9d1df24f-f902-45ac-b3f4-a711dd57c0a5",
+  "bc_start": 1770274800,
+  "bc_end_exclusive": 1772694000
+}

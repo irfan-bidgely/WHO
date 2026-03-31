@@ -4,7 +4,9 @@ Build grounded facts from load-shift API payloads and generate user-facing insig
 Supports Gemini (GEMINI_API_KEY) or OpenAI (OPENAI_API_KEY); see INSIGHT_LLM_PROVIDER.
 Falls back to deterministic text if no key is set or the provider call fails.
 
-One month-level insight per appliance when ``monthly_total_savings`` > 0; otherwise ``insight`` is empty.
+One month-level insight per appliance when ``monthly_total_savings`` > 0; otherwise ``insight``
+is empty. LLM prompts require analyzing the user's time pattern (original vs recommended windows)
+before suggesting copy.
 """
 
 from __future__ import annotations
@@ -264,6 +266,86 @@ def _generalized_cheaper_slot(patterns: list[dict[str, Any]]) -> str | None:
     return None
 
 
+def _select_timing_pattern(patterns: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    Prefer a high-savings shift whose recommended clock is not 00:00 when alternatives
+    within 95% of top portion_savings exist—avoids spurious "around 00:00" when the
+    optimizer returns multiple blocks.
+    """
+    if not patterns:
+        raise ValueError("patterns must be non-empty")
+    top_sav = float(patterns[0]["portion_savings"])
+    if top_sav <= 0:
+        return patterns[0]
+    floor = top_sav * 0.95
+    for p in patterns:
+        if float(p.get("portion_savings", 0.0)) < floor:
+            break
+        rec = str(p.get("recommended_window", "")).strip()
+        m = _REC_SLOT_RE.search(rec)
+        if not m:
+            continue
+        hour = int(m.group(1).split(":")[0])
+        if hour != 0:
+            return p
+    return patterns[0]
+
+
+def _friendly_appliance_label(canonical_name: str) -> str:
+    return str(canonical_name).replace("_", " ").lower()
+
+
+def _day_part_vs_shift(orig_window: str, rec_window: str) -> str:
+    """Compare clock hours in window labels for user-facing 'earlier/later in the day'."""
+    m_orig = _REC_SLOT_RE.search(orig_window)
+    m_rec = _REC_SLOT_RE.search(rec_window)
+    if not m_rec:
+        return "a lower-cost time"
+    ho = int(m_orig.group(1).split(":")[0]) if m_orig else None
+    hn = int(m_rec.group(1).split(":")[0]) if m_rec else None
+    if ho is None or hn is None:
+        return "a lower-cost time"
+    if hn < ho:
+        return "earlier in the day"
+    if hn > ho:
+        return "later in the day"
+    return "a better time slot"
+
+
+def appliance_timing_clause(app: dict[str, Any]) -> str:
+    """
+    Timing-only fragment (no currency) for pairing with bill-share savings percent.
+
+    Example: "shifting water heater usage to earlier in the day, particularly around 04:00"
+    """
+    if not _appliance_monthly_savings_positive(app):
+        return ""
+    patterns: list[dict[str, Any]] = app.get("shift_patterns") or []
+    notes = app.get("pattern_notes") or {}
+    n = int(notes.get("shift_event_count", 0))
+    if not patterns or n < 1:
+        return ""
+
+    friendly = _friendly_appliance_label(str(app.get("name", "appliance")))
+    selected = _select_timing_pattern(patterns)
+
+    if n > 1:
+        general_rec = _generalized_cheaper_slot(patterns)
+        if general_rec is not None and not str(general_rec).strip().startswith("00:00"):
+            return f"shifting {friendly} usage, particularly around {general_rec}"
+
+    orig = str(selected.get("original_window", "")).strip()
+    rec = str(selected.get("recommended_window", "")).strip()
+    m_rec = _REC_SLOT_RE.search(rec)
+    clock = m_rec.group(1) if m_rec else None
+    day = _day_part_vs_shift(orig, rec)
+    if clock:
+        return f"shifting {friendly} usage to {day}, particularly around {clock}"
+    if rec:
+        return f"shifting {friendly} usage from {orig} to {rec}"
+    return f"shifting {friendly} usage to lower-cost times"
+
+
 def _deterministic_one_appliance(app: dict[str, Any], sym: str) -> str:
     """Crisp copy aligned with pattern structure (patterns are savings-sorted)."""
     if not _appliance_monthly_savings_positive(app):
@@ -279,9 +361,9 @@ def _deterministic_one_appliance(app: dict[str, Any], sym: str) -> str:
     if not patterns or n < 1:
         return head
 
-    top = patterns[0]
-    orig = str(top.get("original_window", "")).strip()
-    rec = str(top.get("recommended_window", "")).strip()
+    selected = _select_timing_pattern(patterns)
+    orig = str(selected.get("original_window", "")).strip()
+    rec = str(selected.get("recommended_window", "")).strip()
     general_rec = _generalized_cheaper_slot(patterns)
 
     if n == 1:
@@ -289,7 +371,7 @@ def _deterministic_one_appliance(app: dict[str, Any], sym: str) -> str:
             f"{head} Try shifting from {orig} to {rec}—about {sym}{biggest:.2f} of that."
         )
 
-    if general_rec is not None:
+    if general_rec is not None and not str(general_rec).strip().startswith("00:00"):
         return (
             f"{head} Several changes are suggested; they share a cheaper target around {general_rec} "
             f"instead of peak usage—the largest piece is about {sym}{biggest:.2f}."
@@ -404,13 +486,19 @@ def _insight_llm_prompt_json(facts: dict[str, Any]) -> str:
         if currency
         else "Use the currency field from the input for money formatting."
     )
+    scope_line = (
+        "Analyze the user time pattern (original_window: when usage currently occurs; "
+        "recommended_window: where to shift) using shift_patterns and pattern_summary, "
+        "then suggest the insights."
+    )
     return f"""You are an energy-savings assistant. Output machine-readable JSON only (no markdown fences).
 
 For EACH appliance, work through this privately (do not print these steps—only output the final JSON):
-1) Read shift_patterns and pattern_summary for that appliance.
-2) Decide if recommended_window values express ONE recurring idea (same text repeated, or the same clock time and duration on different days). If yes, phrase the insight in general terms (e.g. use the cheaper window around … / shift out of peak into …)—do not list every Day N line by line.
-3) If recommended windows genuinely differ, summarize the theme using monthly_total_savings and describe the strongest shift in plain language, still grounded in the JSON.
-4) Lead with monthly_total_savings so the user sees the headline saving first.
+1) {scope_line}
+2) Read shift_patterns and pattern_summary for that appliance; align any suggested times with the user's actual current vs recommended windows from the JSON only.
+3) Decide if recommended_window values express ONE recurring idea (same text repeated, or the same clock time and duration on different days). If yes, phrase the insight in general terms (e.g. use the cheaper window around … / shift out of peak into …)—do not list every Day N line by line.
+4) If recommended windows genuinely differ, summarize the theme using monthly_total_savings and describe the strongest shift in plain language, still grounded in the JSON.
+5) Lead with monthly_total_savings so the user sees the headline saving first.
 
 Rules:
 - Use ONLY numbers, names, and times present in the JSON. Do not invent savings or schedules.
@@ -589,14 +677,61 @@ class LoadShiftInsightService:
     def build_facts(self, payload: dict[str, Any]) -> dict[str, Any]:
         return build_insight_facts(payload, mapping=self._mapping)
 
-    def generate_insight(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def generate_insight(
+        self,
+        payload: dict[str, Any],
+        *,
+        bill_cost_by_app: dict[int, float] | None = None,
+        bill_share_only: bool = False,
+    ) -> dict[str, Any]:
         """
         Return API-shaped dict with ``metadata``, ``appliances`` (``insight`` text only
         if ``monthlyTotalSavings`` > 0; else ``""``), ``source``, and optional ``facts``.
+
+        If ``bill_cost_by_app`` maps ``appId`` -> dashboard bill cost for the period,
+        matching appliances get the same bill-share percent + timing sentence as
+        ``/api/build-merged-optimize``.
+
+        When ``bill_share_only`` is True (typical with non-empty ``bill_cost_by_app``),
+        skip LLM/deterministic dollar copy and emit ``source`` ``bill-share`` only.
         """
         facts = self.build_facts(payload)
+
+        def _maybe_apply_bill_share(result: dict[str, Any]) -> dict[str, Any]:
+            if bill_cost_by_app:
+                from .merged_optimize_insights import apply_bill_share_to_load_shift_response
+
+                apply_bill_share_to_load_shift_response(result, facts, bill_cost_by_app)
+                result["source"] = "bill-share"
+            return result
+
+        if (
+            bill_share_only
+            and bill_cost_by_app
+            and isinstance(facts.get("appliances"), list)
+        ):
+            from .merged_optimize_insights import apply_bill_share_to_load_shift_response
+
+            appliances_payload: list[dict[str, Any]] = []
+            for a in facts["appliances"]:
+                appliances_payload.append(
+                    {
+                        "appId": a["app_id"],
+                        "name": a["name"],
+                        "monthlyTotalSavings": a["monthly_total_savings"],
+                        "insight": "",
+                    }
+                )
+            result = _insight_payload_with_facts(
+                facts,
+                appliances=appliances_payload,
+                source="bill-share",
+            )
+            apply_bill_share_to_load_shift_response(result, facts, bill_cost_by_app)
+            return result
+
         if not _facts_has_any_positive_savings(facts):
-            return _deterministic_payload(facts)
+            return _maybe_apply_bill_share(_deterministic_payload(facts))
 
         provider = _resolve_insight_provider()
         prompt = _insight_llm_prompt_json(facts)
@@ -605,7 +740,7 @@ class LoadShiftInsightService:
             logger.warning(
                 "No GEMINI_API_KEY or OPENAI_API_KEY set; using deterministic insights"
             )
-            return _deterministic_payload(facts)
+            return _maybe_apply_bill_share(_deterministic_payload(facts))
 
         if provider == "openai":
             api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
@@ -613,15 +748,17 @@ class LoadShiftInsightService:
                 logger.warning(
                     "INSIGHT_LLM_PROVIDER=openai but OPENAI_API_KEY missing; using deterministic"
                 )
-                return _deterministic_payload(facts)
-            return _run_llm_insight_pipeline(
-                facts,
-                provider_source="openai",
-                log_label="OpenAI",
-                generate_text=lambda: _generate_with_openai(
-                    api_key=api_key, model=self._openai_model, prompt=prompt
-                ),
-                import_error_log="openai package not installed",
+                return _maybe_apply_bill_share(_deterministic_payload(facts))
+            return _maybe_apply_bill_share(
+                _run_llm_insight_pipeline(
+                    facts,
+                    provider_source="openai",
+                    log_label="OpenAI",
+                    generate_text=lambda: _generate_with_openai(
+                        api_key=api_key, model=self._openai_model, prompt=prompt
+                    ),
+                    import_error_log="openai package not installed",
+                )
             )
 
         api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
@@ -629,13 +766,15 @@ class LoadShiftInsightService:
             logger.warning(
                 "INSIGHT_LLM_PROVIDER=gemini but GEMINI_API_KEY missing; using deterministic"
             )
-            return _deterministic_payload(facts)
-        return _run_llm_insight_pipeline(
-            facts,
-            provider_source="gemini",
-            log_label="Gemini",
-            generate_text=lambda: _generate_with_gemini(
-                api_key=api_key, model=self._gemini_model, prompt=prompt
-            ),
-            import_error_log="google-genai not installed",
+            return _maybe_apply_bill_share(_deterministic_payload(facts))
+        return _maybe_apply_bill_share(
+            _run_llm_insight_pipeline(
+                facts,
+                provider_source="gemini",
+                log_label="Gemini",
+                generate_text=lambda: _generate_with_gemini(
+                    api_key=api_key, model=self._gemini_model, prompt=prompt
+                ),
+                import_error_log="google-genai not installed",
+            )
         )

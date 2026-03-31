@@ -8,7 +8,8 @@ import Paper from '@mui/material/Paper';
 import Stack from '@mui/material/Stack';
 import TextField from '@mui/material/TextField';
 import Typography from '@mui/material/Typography';
-import { setTitle } from '../features/who/whoSlice';
+import { analyzeConstraint } from '../features/who/analyzeConstraintApi';
+import { applyConstraintWindow, type TimelineApplianceId } from '../features/who/whoSlice';
 import { useAppDispatch, useAppSelector } from '../store/hooks';
 import { HourScale } from './HourScale';
 import { TimelineRangeBar } from './TimelineRangeBar';
@@ -21,6 +22,49 @@ export function WhoWidget() {
   const dispatch = useAppDispatch();
   const title = useAppSelector((s) => s.who.title);
   const [lifestyleInput, setLifestyleInput] = useState('');
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [analysisSuccessMessage, setAnalysisSuccessMessage] = useState<string | null>(null);
+  const [analysisErrorMessage, setAnalysisErrorMessage] = useState<string | null>(null);
+  const applianceIdToTimelineId: Record<number, TimelineApplianceId | undefined> = {
+    18: 'ev',
+    4: 'ac',
+  };
+
+  const handleAnalyzeConstraints = async () => {
+    if (!lifestyleInput.trim()) {
+      setAnalysisSuccessMessage(null);
+      setAnalysisErrorMessage('Please enter a constraint first.');
+      return;
+    }
+    setIsAnalyzing(true);
+    setAnalysisSuccessMessage(null);
+    setAnalysisErrorMessage(null);
+    try {
+      const result = await analyzeConstraint({
+        constraintText: lifestyleInput.trim(),
+      });
+
+      let appliedCount = 0;
+      for (const appliance of result.applianceConstraints) {
+        const timelineId = applianceIdToTimelineId[appliance.applianceId];
+        if (!timelineId) continue;
+        const firstWindow = appliance.blockConstraints.allowedWindows?.[0];
+        if (!firstWindow) continue;
+        dispatch(applyConstraintWindow({ id: timelineId, window: firstWindow }));
+        appliedCount += 1;
+      }
+
+      if (appliedCount === 0) {
+        setAnalysisErrorMessage('No allowed window found in the text.');
+      } else {
+        setAnalysisSuccessMessage(`Applied constraints to ${appliedCount} appliance(s).`);
+      }
+    } catch {
+      setAnalysisErrorMessage('Could not analyze constraints. Please try again.');
+    } finally {
+      setIsAnalyzing(false);
+    }
+  };
 
   const chartData = useMemo(
     () => [
@@ -186,11 +230,22 @@ export function WhoWidget() {
                   type="button"
                   variant="contained"
                   sx={{ px: 3, py: 1.2, borderRadius: 2, bgcolor: '#5c6bc0' }}
-                  onClick={() => dispatch(setTitle('Whole Home Optimizer'))}
+                  onClick={handleAnalyzeConstraints}
+                  disabled={isAnalyzing}
                 >
-                  Analyze →
+                  {isAnalyzing ? 'Analyzing...' : 'Analyze \u2192'}
                 </Button>
               </Stack>
+              {analysisErrorMessage ? (
+                <Typography variant="caption" color="error.main">
+                  {analysisErrorMessage}
+                </Typography>
+              ) : null}
+              {analysisSuccessMessage ? (
+                <Typography variant="caption" color="success.main">
+                  {analysisSuccessMessage}
+                </Typography>
+              ) : null}
             </Stack>
           </CardContent>
         </Card>
