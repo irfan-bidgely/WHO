@@ -2,6 +2,8 @@ import json
 import logging
 import os
 from pathlib import Path
+
+from dotenv import load_dotenv
 from typing import Optional
 
 import requests
@@ -15,6 +17,17 @@ from pipeline_build_merged import (
     fetch_latest_bill_cycle_row_from_usage_chart,
 )
 
+from insights import build_insight_by_app_id, insights_bp
+from optimize_insights_common import (
+    OPTIMIZER_OPTIMIZE_URL,
+    SHIFTABLE_APPLIANCE_IDS,
+    current_by_app_from_latest_row,
+    extract_savings_by_app,
+    log_optimizer_http_response,
+)
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -22,7 +35,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-SHIFTABLE_APPLIANCE_IDS = [18, 2, 3, 4, 7, 30]
+
+app.register_blueprint(insights_bp)
 # Preserve insertion order in JSON output (avoid alphabetical sorting).
 app.json.sort_keys = False
 
@@ -205,112 +219,35 @@ def build_merged_optimize():
 
     current_total_cost = float(latest_row.get("cost") or 0.0)
     current_total_consumption = float(latest_row.get("consumption") or 0.0)
-    itemizations = latest_row.get("itemizationDetailsList") or []
 
-    # Per your clarification: dashboard itemizationDetailsList[].id is the appliance appId.
-    # We treat "usage" as consumption (same unit as dashboard "consumption").
-    current_by_app: dict[int, dict[str, float]] = {
-        app_id: {"cost": 0.0, "consumption": 0.0} for app_id in SHIFTABLE_APPLIANCE_IDS
-    }
-    if isinstance(itemizations, list):
-        for it in itemizations:
-            if not isinstance(it, dict):
-                continue
-            if it.get("id") is None:
-                continue
-            try:
-                app_id = int(it["id"])
-            except Exception:
-                continue
-            if app_id not in SHIFTABLE_APPLIANCE_IDS:
-                continue
-            current_by_app[app_id] = {
-                "cost": float(it.get("cost") or 0.0),
-                "consumption": float(it.get("usage") or 0.0),
-            }
+    # itemizationDetailsList[].id = appId; usage = consumption (dashboard convention).
+    current_by_app = current_by_app_from_latest_row(
+        latest_row,
+        shiftable_ids=SHIFTABLE_APPLIANCE_IDS,
+    )
 
     try:
         opt_resp = requests.post(
-            "http://127.0.0.1:8000/optimize",
+            OPTIMIZER_OPTIMIZE_URL,
             json=merged,
             timeout=300,
         )
+        log_optimizer_http_response(logger, opt_resp)
         opt_resp.raise_for_status()
         opt_json = opt_resp.json()
     except Exception as e:  # noqa: BLE001
         logger.exception("build_merged_optimize: optimizer call failed")
         return {"error": str(e)}, 502
 
-    def _extract_savings_by_app(obj: object) -> dict[int, dict[str, float]]:
-        out: dict[int, dict[str, float]] = {}
+    savings_by_app = extract_savings_by_app(opt_json)
 
-        def add(app_id: int, *, cost: float = 0.0, cons: float = 0.0) -> None:
-            if app_id not in out:
-                out[app_id] = {"costSavings": 0.0, "consumptionSavings": 0.0}
-            out[app_id]["costSavings"] += float(cost or 0.0)
-            out[app_id]["consumptionSavings"] += float(cons or 0.0)
-
-        # Optimizer response format we have:
-        # { metadata: {...}, loadShift: [ {appId, totalSavings, blockShifts:[{savings,...}, ...]}, ... ] }
-        if isinstance(obj, dict) and isinstance(obj.get("loadShift"), list):
-            for it in obj.get("loadShift") or []:
-                if not isinstance(it, dict):
-                    continue
-                if it.get("appId") is None:
-                    continue
-                try:
-                    app_id = int(it["appId"])
-                except Exception:
-                    continue
-
-                total_s = it.get("totalSavings")
-                if total_s is None:
-                    total_s = 0.0
-                    for bs in it.get("blockShifts") or []:
-                        if isinstance(bs, dict) and bs.get("savings") is not None:
-                            try:
-                                total_s += float(bs["savings"])
-                            except Exception:
-                                pass
-                add(app_id, cost=float(total_s or 0.0), cons=0.0)
-            return out
-
-        def walk(x: object) -> None:
-            if isinstance(x, dict):
-                app_id = None
-                if "appId" in x and x["appId"] is not None:
-                    try:
-                        app_id = int(x["appId"])
-                    except Exception:
-                        app_id = None
-                if app_id is not None:
-                    cost_s = (
-                        x.get("costSavings")
-                        or x.get("savingsCost")
-                        or x.get("savings_cost")
-                        or x.get("savings_cost_inr")
-                        or 0.0
-                    )
-                    cons_s = (
-                        x.get("consumptionSavings")
-                        or x.get("savingsConsumption")
-                        or x.get("savings_consumption")
-                        or 0.0
-                    )
-                    if not cost_s and not cons_s and x.get("savings") is not None:
-                        cost_s = x.get("savings")
-                    add(app_id, cost=float(cost_s or 0.0), cons=float(cons_s or 0.0))
-
-                for v in x.values():
-                    walk(v)
-            elif isinstance(x, list):
-                for it in x:
-                    walk(it)
-
-        walk(obj)
-        return out
-
-    savings_by_app = _extract_savings_by_app(opt_json)
+    insight_by_app = build_insight_by_app_id(
+        opt_json=opt_json if isinstance(opt_json, dict) else {},
+        current_by_app=current_by_app,
+        savings_by_app=savings_by_app,
+        shiftable_app_ids=SHIFTABLE_APPLIANCE_IDS,
+        appliance_catalog=APPLIANCE_CATALOG,
+    )
 
     appliances_out = []
     total_shiftable_cost_savings = 0.0
@@ -331,6 +268,7 @@ def build_merged_optimize():
                 "current": cur,
                 "savings": sav,
                 "best": {"cost": best_cost, "consumption": best_cons},
+                "insight": insight_by_app.get(app_id, ""),
             }
         )
         total_shiftable_cost_savings += float(sav["costSavings"] or 0.0)
