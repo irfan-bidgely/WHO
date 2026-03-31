@@ -1,12 +1,19 @@
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
-from flask import Flask, jsonify, render_template, request
+import requests
+from flask import Flask, Response, jsonify, render_template, request
 from pydantic import BaseModel, Field, ValidationError
 
 from constraint_analyzer import analyze_constraint_text
+from pipeline_build_merged import (
+    build_merged_for_uuid,
+    dashboard_usage_config,
+    fetch_latest_bill_cycle_row_from_usage_chart,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -16,6 +23,8 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 SHIFTABLE_APPLIANCE_IDS = [18, 2, 3, 4, 7, 30]
+# Preserve insertion order in JSON output (avoid alphabetical sorting).
+app.json.sort_keys = False
 
 
 def _load_appliance_catalog() -> dict[int, str]:
@@ -108,6 +117,234 @@ def health():
     return {"status": "ok"}
 
 
+@app.post("/api/build-merged")
+def build_merged():
+    """
+    Build merged_rates_appliances payload for a UUID.
+
+    Body JSON:
+      { "uuid": "<uuid>", "timezone": "UTC" }
+      Optional: { "userUuid": "<userUuid>" } if dashboard UUID differs from S3 UUID.
+    """
+    body = request.get_json(silent=True) or {}
+    uuid = (body.get("uuid") or "").strip()
+    user_uuid = (body.get("userUuid") or "").strip() or None
+    timezone = (body.get("timezone") or "UTC").strip()
+    if not uuid:
+        return {"error": "uuid is required"}, 400
+
+    try:
+        merged = build_merged_for_uuid(
+            uuid,
+            user_uuid=user_uuid,
+            out_dir=Path(__file__).resolve().parent / "docs",
+            shiftable_ids=set(SHIFTABLE_APPLIANCE_IDS),
+            timezone=timezone,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.exception("build_merged failed")
+        return {"error": str(e)}, 500
+
+    # Ensure key order is preserved in the response text.
+    return Response(json.dumps(merged, ensure_ascii=False), mimetype="application/json")
+
+
+@app.post("/api/build-merged-optimize")
+def build_merged_optimize():
+    """
+    Build merged payload then call local optimizer FastAPI.
+
+    Optimizer URL: http://127.0.0.1:8000/optimize
+    """
+    body = request.get_json(silent=True) or {}
+    uuid = (body.get("uuid") or "").strip()
+    user_uuid = (body.get("userUuid") or "").strip() or None
+    timezone = (body.get("timezone") or "UTC").strip()
+    if not uuid:
+        return {"error": "uuid is required"}, 400
+
+    try:
+        merged = build_merged_for_uuid(
+            uuid,
+            user_uuid=user_uuid,
+            out_dir=Path(__file__).resolve().parent / "docs",
+            shiftable_ids=set(SHIFTABLE_APPLIANCE_IDS),
+            timezone=timezone,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.exception("build_merged_optimize: build_merged_for_uuid failed")
+        return {"error": str(e)}, 500
+
+    # Fetch current bill-cycle totals + appliance breakdown from dashboard (latest bill cycle).
+    try:
+        cfg = dashboard_usage_config()
+        dashboard_user_uuid = user_uuid or uuid
+        latest_row = fetch_latest_bill_cycle_row_from_usage_chart(dashboard_user_uuid, cfg)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("build_merged_optimize: dashboard usage fetch failed")
+        return {"error": str(e)}, 502
+
+    current_total_cost = float(latest_row.get("cost") or 0.0)
+    current_total_consumption = float(latest_row.get("consumption") or 0.0)
+    itemizations = latest_row.get("itemizationDetailsList") or []
+
+    # Per your clarification: dashboard itemizationDetailsList[].id is the appliance appId.
+    # We treat "usage" as consumption (same unit as dashboard "consumption").
+    current_by_app: dict[int, dict[str, float]] = {
+        app_id: {"cost": 0.0, "consumption": 0.0} for app_id in SHIFTABLE_APPLIANCE_IDS
+    }
+    if isinstance(itemizations, list):
+        for it in itemizations:
+            if not isinstance(it, dict):
+                continue
+            if it.get("id") is None:
+                continue
+            try:
+                app_id = int(it["id"])
+            except Exception:
+                continue
+            if app_id not in SHIFTABLE_APPLIANCE_IDS:
+                continue
+            current_by_app[app_id] = {
+                "cost": float(it.get("cost") or 0.0),
+                "consumption": float(it.get("usage") or 0.0),
+            }
+
+    try:
+        opt_resp = requests.post(
+            "http://127.0.0.1:8000/optimize",
+            json=merged,
+            timeout=300,
+        )
+        opt_resp.raise_for_status()
+        opt_json = opt_resp.json()
+    except Exception as e:  # noqa: BLE001
+        logger.exception("build_merged_optimize: optimizer call failed")
+        return {"error": str(e)}, 502
+
+    def _extract_savings_by_app(obj: object) -> dict[int, dict[str, float]]:
+        out: dict[int, dict[str, float]] = {}
+
+        def add(app_id: int, *, cost: float = 0.0, cons: float = 0.0) -> None:
+            if app_id not in out:
+                out[app_id] = {"costSavings": 0.0, "consumptionSavings": 0.0}
+            out[app_id]["costSavings"] += float(cost or 0.0)
+            out[app_id]["consumptionSavings"] += float(cons or 0.0)
+
+        # Optimizer response format we have:
+        # { metadata: {...}, loadShift: [ {appId, totalSavings, blockShifts:[{savings,...}, ...]}, ... ] }
+        if isinstance(obj, dict) and isinstance(obj.get("loadShift"), list):
+            for it in obj.get("loadShift") or []:
+                if not isinstance(it, dict):
+                    continue
+                if it.get("appId") is None:
+                    continue
+                try:
+                    app_id = int(it["appId"])
+                except Exception:
+                    continue
+
+                total_s = it.get("totalSavings")
+                if total_s is None:
+                    total_s = 0.0
+                    for bs in it.get("blockShifts") or []:
+                        if isinstance(bs, dict) and bs.get("savings") is not None:
+                            try:
+                                total_s += float(bs["savings"])
+                            except Exception:
+                                pass
+                add(app_id, cost=float(total_s or 0.0), cons=0.0)
+            return out
+
+        def walk(x: object) -> None:
+            if isinstance(x, dict):
+                app_id = None
+                if "appId" in x and x["appId"] is not None:
+                    try:
+                        app_id = int(x["appId"])
+                    except Exception:
+                        app_id = None
+                if app_id is not None:
+                    cost_s = (
+                        x.get("costSavings")
+                        or x.get("savingsCost")
+                        or x.get("savings_cost")
+                        or x.get("savings_cost_inr")
+                        or 0.0
+                    )
+                    cons_s = (
+                        x.get("consumptionSavings")
+                        or x.get("savingsConsumption")
+                        or x.get("savings_consumption")
+                        or 0.0
+                    )
+                    if not cost_s and not cons_s and x.get("savings") is not None:
+                        cost_s = x.get("savings")
+                    add(app_id, cost=float(cost_s or 0.0), cons=float(cons_s or 0.0))
+
+                for v in x.values():
+                    walk(v)
+            elif isinstance(x, list):
+                for it in x:
+                    walk(it)
+
+        walk(obj)
+        return out
+
+    savings_by_app = _extract_savings_by_app(opt_json)
+
+    appliances_out = []
+    total_shiftable_cost_savings = 0.0
+    total_shiftable_consumption_savings = 0.0
+    for app_id in SHIFTABLE_APPLIANCE_IDS:
+        cur = current_by_app.get(app_id, {"cost": 0.0, "consumption": 0.0})
+        sav = savings_by_app.get(app_id, {"costSavings": 0.0, "consumptionSavings": 0.0})
+        # We only have reliable savings per appliance from optimizer, but not current per appliance.
+        # Avoid negative numbers for per-appliance "best".
+        best_cost = max(0.0, cur["cost"] - float(sav["costSavings"] or 0.0))
+        # Load shifting changes timing, not energy consumed. Keep consumption unchanged unless
+        # an optimizer explicitly returns kWh savings.
+        best_cons = cur["consumption"]
+        appliances_out.append(
+            {
+                "appId": app_id,
+                "name": APPLIANCE_CATALOG.get(app_id, f"UNKNOWN_{app_id}"),
+                "current": cur,
+                "savings": sav,
+                "best": {"cost": best_cost, "consumption": best_cons},
+            }
+        )
+        total_shiftable_cost_savings += float(sav["costSavings"] or 0.0)
+        total_shiftable_consumption_savings += float(sav["consumptionSavings"] or 0.0)
+
+    final = {
+        "billCycle": {
+            "intervalStart": latest_row.get("intervalStart"),
+            "intervalEnd": latest_row.get("intervalEnd"),
+        },
+        "total": {
+            "current": {"cost": current_total_cost, "consumption": current_total_consumption},
+            "shiftableSavings": {
+                "costSavings": total_shiftable_cost_savings,
+                "consumptionSavings": total_shiftable_consumption_savings,
+            },
+            "best": {
+                "cost": max(0.0, current_total_cost - total_shiftable_cost_savings),
+                "consumption": current_total_consumption,
+            },
+        },
+        "appliances": appliances_out,
+        "note": (
+            "Dashboard itemizationDetailsList[].id is treated as appliance appId; "
+            "itemizationDetailsList[].usage is treated as appliance consumption. "
+            "Optimizer savings are applied to totals; per-appliance best is clamped >= 0. "
+            "Consumption does not decrease with load shifting."
+        ),
+    }
+
+    return Response(json.dumps(final, ensure_ascii=False), mimetype="application/json")
+
+
 @app.route("/analyze-constraint", methods=["POST", "OPTIONS"])
 def analyze_constraint():
     if request.method == "OPTIONS":
@@ -165,5 +402,6 @@ def analyze_constraint():
 
 
 if __name__ == "__main__":
-    logger.info("Starting Flask on http://127.0.0.1:5000")
-    app.run(debug=True, host="127.0.0.1", port=5000)
+    port = int(os.environ.get("PORT", "5001"))
+    logger.info("Starting Flask on http://127.0.0.1:%s", port)
+    app.run(debug=True, host="127.0.0.1", port=port)
