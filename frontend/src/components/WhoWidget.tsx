@@ -7,11 +7,14 @@ import CircularProgress from '@mui/material/CircularProgress';
 import Divider from '@mui/material/Divider';
 import Paper from '@mui/material/Paper';
 import Stack from '@mui/material/Stack';
+import Tab from '@mui/material/Tab';
+import Tabs from '@mui/material/Tabs';
 import TextField from '@mui/material/TextField';
 import Typography from '@mui/material/Typography';
 import {
   buildOptimizeDisplayState,
   fetchBuildMergedOptimize,
+  type OptimizeDisplayState,
 } from '../features/who/buildMergedOptimizeApi';
 import { defaultTimelineRangeForAppId, syncTimelineForAppIds } from '../features/who/whoSlice';
 import { useAppDispatch, useAppSelector } from '../store/hooks';
@@ -51,24 +54,7 @@ export function WhoWidget() {
   const [graphErrorMessage, setGraphErrorMessage] = useState<string | null>(null);
   const [analysisSuccessMessage, setAnalysisSuccessMessage] = useState<string | null>(null);
   const [analysisErrorMessage, setAnalysisErrorMessage] = useState<string | null>(null);
-  const [optimizeData, setOptimizeData] = useState<{
-    billCycleStart: number | null;
-    billCycleEnd: number | null;
-    totalCurrentCost: number;
-    totalBaselineBestCost: number;
-    totalConstrainedBestCost: number;
-    hasConstrainedRun: boolean;
-    appliances: Array<{
-      appId: number;
-      name: string;
-      insight?: string;
-      currentCost: number;
-      currentConsumption: number;
-      baselineBestCost: number;
-      constrainedBestCost: number;
-      costSavings: number;
-    }>;
-  } | null>(null);
+  const [optimizeData, setOptimizeData] = useState<OptimizeDisplayState | null>(null);
 
   useLayoutEffect(() => {
     if (!optimizeData?.appliances.length) {
@@ -110,7 +96,7 @@ export function WhoWidget() {
 
     if (analysisInputMode === 'sliders' && sliderConstraints.length === 0) {
       setAnalysisSuccessMessage(null);
-      setAnalysisErrorMessage('Load appliance data first (same list as the chart above).');
+      setAnalysisErrorMessage('Load appliance data first (same appliances as the cost chart).');
       return;
     }
 
@@ -223,25 +209,24 @@ export function WhoWidget() {
     return `${fmt.format(start)} - ${fmt.format(end)}`;
   }, [optimizeData]);
 
-  const applianceInsights = useMemo(
-    () =>
-      (optimizeData?.appliances ?? [])
-        .filter((appliance) => Boolean(appliance.insight?.trim()))
-        .map((appliance) => ({
-          key: appliance.appId,
-          title: appliance.name.replaceAll('_', ' '),
-          text: appliance.insight!.trim(),
-        })),
-    [optimizeData],
+  const emptyInsightPair = useMemo(
+    () => [
+      { key: 'placeholder-0', title: 'Insight', text: '', empty: true as const },
+      { key: 'placeholder-1', title: 'Insight', text: '', empty: true as const },
+    ],
+    [],
   );
 
-  const insights = useMemo(
+  const actualInsightRow = optimizeData?.actualInsightBoxes ?? emptyInsightPair;
+  const constrainedInsightRow = optimizeData?.constrainedInsightBoxes ?? emptyInsightPair;
+
+  const summaryInsights = useMemo(
     () => {
       if (!optimizeData) {
         return [
-          { title: 'Optimization', value: 'Loading...', color: '#2e7d32' },
-          { title: 'Cost', value: 'Loading...', color: '#ef6c00' },
-          { title: 'Appliances', value: 'Loading...', color: '#6a1b9a' },
+          { key: 's0', title: 'Optimization', value: 'Loading...', color: '#2e7d32' },
+          { key: 's1', title: 'Cost', value: 'Loading...', color: '#ef6c00' },
+          { key: 's2', title: 'Appliances', value: 'Loading...', color: '#6a1b9a' },
         ];
       }
       const topSavings = [...optimizeData.appliances]
@@ -252,11 +237,13 @@ export function WhoWidget() {
       const third = topSavings[2];
       return [
         {
+          key: 'top-saver',
           title: `Top Saver: ${first?.name?.replaceAll('_', ' ') ?? 'N/A'}`,
           value: `Save ${formatUsd(Number(first?.costSavings ?? 0))}`,
           color: '#2e7d32',
         },
         {
+          key: 'totals',
           title: optimizeData.hasConstrainedRun ? 'Total: Actual / Best / Constrained' : 'Total: Actual / Best',
           value: optimizeData.hasConstrainedRun
             ? `${formatUsd(optimizeData.totalCurrentCost)} · ${formatUsd(optimizeData.totalBaselineBestCost)} · ${formatUsd(optimizeData.totalConstrainedBestCost)}`
@@ -264,6 +251,7 @@ export function WhoWidget() {
           color: '#ef6c00',
         },
         {
+          key: 'next-saver',
           title: `Next: ${second?.name?.replaceAll('_', ' ') ?? third?.name?.replaceAll('_', ' ') ?? 'N/A'}`,
           value: `Save ${formatUsd(Number((second ?? third)?.costSavings ?? 0))}`,
           color: '#6a1b9a',
@@ -272,14 +260,6 @@ export function WhoWidget() {
     },
     [optimizeData],
   );
-  const allInsights = useMemo(() => {
-    const applianceCards = applianceInsights.map((item) => ({
-      title: `${item.title} Insight`,
-      value: item.text,
-      color: '#455a64',
-    }));
-    return [...insights, ...applianceCards];
-  }, [applianceInsights, insights]);
 
   return (
     <Paper
@@ -349,77 +329,106 @@ export function WhoWidget() {
 
                 <Divider orientation="vertical" flexItem />
 
-                <Stack direction="row" spacing={{ xs: 2, md: 4 }} alignItems="flex-end" sx={{ pb: 1 }}>
-                  {chartData.map((item) => (
-                    <Stack key={item.label} spacing={1} alignItems="center" sx={{ maxWidth: 140 }}>
-                      <Stack direction="row" spacing={0.35} alignItems="flex-end" sx={{ height: 160 }}>
-                        <Box
-                          sx={{
-                            width: showConstrainedBar ? 14 : 18,
-                            height: item.actual,
-                            bgcolor: '#1976d2',
-                            borderRadius: 0.5,
-                          }}
-                        />
-                        <Box
-                          sx={{
-                            width: showConstrainedBar ? 14 : 18,
-                            height: item.baselineBest,
-                            bgcolor: '#2e7d32',
-                            borderRadius: 0.5,
-                          }}
-                        />
-                        {showConstrainedBar ? (
+                <Box
+                  sx={{
+                    flex: 1,
+                    minWidth: 0,
+                    display: 'flex',
+                    flexDirection: { xs: 'column', sm: 'row' },
+                    alignItems: { xs: 'stretch', sm: 'flex-end' },
+                    gap: { xs: 1.5, sm: 2 },
+                  }}
+                >
+                  <Stack
+                    direction="row"
+                    spacing={{ xs: 2, md: 4 }}
+                    alignItems="flex-end"
+                    sx={{ pb: 1, flex: 1, minWidth: 0 }}
+                  >
+                    {chartData.map((item) => (
+                      <Stack key={item.label} spacing={1} alignItems="center" sx={{ maxWidth: 140 }}>
+                        <Stack direction="row" spacing={0.35} alignItems="flex-end" sx={{ height: 160 }}>
                           <Box
                             sx={{
-                              width: 14,
-                              height: item.constrainedBest,
-                              bgcolor: '#ed6c02',
+                              width: showConstrainedBar ? 14 : 18,
+                              height: item.actual,
+                              bgcolor: '#1976d2',
                               borderRadius: 0.5,
                             }}
                           />
-                        ) : null}
+                          <Box
+                            sx={{
+                              width: showConstrainedBar ? 14 : 18,
+                              height: item.baselineBest,
+                              bgcolor: '#2e7d32',
+                              borderRadius: 0.5,
+                            }}
+                          />
+                          {showConstrainedBar ? (
+                            <Box
+                              sx={{
+                                width: 14,
+                                height: item.constrainedBest,
+                                bgcolor: '#ed6c02',
+                                borderRadius: 0.5,
+                              }}
+                            />
+                          ) : null}
+                        </Stack>
+                        <Typography variant="caption" color="text.secondary" textAlign="center">
+                          {item.label}
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary" textAlign="center" sx={{ lineHeight: 1.35 }}>
+                          {showConstrainedBar ? (
+                            <>
+                              {formatUsd(item.actualCost)} · {formatUsd(item.baselineBestCost)} ·{' '}
+                              {formatUsd(item.constrainedBestCost)}
+                            </>
+                          ) : (
+                            <>
+                              {formatUsd(item.actualCost)} {'->'} {formatUsd(item.baselineBestCost)}
+                            </>
+                          )}
+                        </Typography>
                       </Stack>
-                      <Typography variant="caption" color="text.secondary" textAlign="center">
-                        {item.label}
-                      </Typography>
-                      <Typography variant="caption" color="text.secondary" textAlign="center" sx={{ lineHeight: 1.35 }}>
-                        {showConstrainedBar ? (
-                          <>
-                            {formatUsd(item.actualCost)} · {formatUsd(item.baselineBestCost)} ·{' '}
-                            {formatUsd(item.constrainedBestCost)}
-                          </>
-                        ) : (
-                          <>
-                            {formatUsd(item.actualCost)} {'->'} {formatUsd(item.baselineBestCost)}
-                          </>
-                        )}
-                      </Typography>
-                    </Stack>
-                  ))}
-                </Stack>
-              </Stack>
-              <Stack direction="row" spacing={2} alignItems="center" sx={{ flexWrap: 'wrap', gap: 1 }}>
-                <Stack direction="row" spacing={1} alignItems="center">
-                  <Box sx={{ width: 12, height: 12, bgcolor: '#1976d2' }} />
-                  <Typography variant="body2" color="text.secondary">
-                    Actual
-                  </Typography>
-                </Stack>
-                <Stack direction="row" spacing={1} alignItems="center">
-                  <Box sx={{ width: 12, height: 12, bgcolor: '#2e7d32' }} />
-                  <Typography variant="body2" color="text.secondary">
-                    Best
-                  </Typography>
-                </Stack>
-                {showConstrainedBar ? (
-                  <Stack direction="row" spacing={1} alignItems="center">
-                    <Box sx={{ width: 12, height: 12, bgcolor: '#ed6c02' }} />
-                    <Typography variant="body2" color="text.secondary">
-                      Constrained
-                    </Typography>
+                    ))}
                   </Stack>
-                ) : null}
+
+                  <Stack
+                    direction="column"
+                    spacing={0.5}
+                    sx={{
+                      flexShrink: 0,
+                      pb: 1,
+                      alignSelf: { xs: 'center', sm: 'flex-end' },
+                      pl: { xs: 0, sm: 2 },
+                      borderLeft: { xs: 'none', sm: (theme) => `1px solid ${theme.palette.divider}` },
+                    }}
+                  >
+                    <Stack direction="row" spacing={2} alignItems="center" sx={{ flexWrap: 'wrap', gap: 1 }}>
+                      <Stack direction="row" spacing={1} alignItems="center">
+                        <Box sx={{ width: 12, height: 12, bgcolor: '#1976d2', flexShrink: 0 }} />
+                        <Typography variant="body2" color="text.secondary">
+                          Actual
+                        </Typography>
+                      </Stack>
+                      <Stack direction="row" spacing={1} alignItems="center">
+                        <Box sx={{ width: 12, height: 12, bgcolor: '#2e7d32', flexShrink: 0 }} />
+                        <Typography variant="body2" color="text.secondary">
+                          Best
+                        </Typography>
+                      </Stack>
+                      {showConstrainedBar ? (
+                        <Stack direction="row" spacing={1} alignItems="center">
+                          <Box sx={{ width: 12, height: 12, bgcolor: '#ed6c02', flexShrink: 0 }} />
+                          <Typography variant="body2" color="text.secondary">
+                            Constrained
+                          </Typography>
+                        </Stack>
+                      ) : null}
+                    </Stack>
+                  </Stack>
+                </Box>
               </Stack>
             </Stack>
             {graphErrorMessage ? (
@@ -430,113 +439,198 @@ export function WhoWidget() {
           </CardContent>
         </Card>
 
-        <Stack spacing={1}>
+        <Stack spacing={0.5}>
+            <Typography variant="subtitle2" color="text.secondary">
+              All summaries
+            </Typography>
+            <Stack direction={{ xs: 'column', md: 'row' }} spacing={2}>
+              {summaryInsights.map((item) => (
+                <Card
+                  key={item.key}
+                  elevation={0}
+                  sx={{
+                    flex: 1,
+                    borderRadius: 2,
+                    border: '1px solid',
+                    borderColor: 'divider',
+                  }}
+                >
+                  <CardContent sx={{ py: 2 }}>
+                    <Typography variant="body2" color="text.secondary">
+                      {item.title}
+                    </Typography>
+                    <Typography variant="h6" sx={{ mt: 1, color: item.color }}>
+                      {item.value}
+                    </Typography>
+                  </CardContent>
+                </Card>
+              ))}
+            </Stack>
+          </Stack>
+
+        <Stack spacing={2}>
           <Typography variant="h6" color="text.primary">
             Insights
           </Typography>
-          <Stack direction={{ xs: 'column', md: 'row' }} spacing={2}>
-            {allInsights.map((item) => (
-              <Card key={item.title} elevation={0} sx={{ flex: 1, borderRadius: 3 }}>
-                <CardContent>
-                  <Typography variant="body2" color="text.secondary">
-                    {item.title}
-                  </Typography>
-                  <Typography variant="h6" sx={{ mt: 1, color: item.color }}>
-                    {item.value}
-                  </Typography>
-                </CardContent>
-              </Card>
-            ))}
+
+
+
+          <Stack spacing={0.5}>
+            <Typography variant="subtitle2" color="text.secondary">
+              Best case insights
+            </Typography>
+            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
+              {actualInsightRow.map((box) => (
+                <Card
+                  key={`actual-${box.key}`}
+                  elevation={0}
+                  sx={{
+                    flex: 1,
+                    borderRadius: 2,
+                    border: '1px solid',
+                    borderColor: 'divider',
+                  }}
+                >
+                  <CardContent sx={{ py: 2 }}>
+                    <Typography variant="body2" color="text.secondary">
+                      {box.empty ? '—' : box.title}
+                    </Typography>
+                    <Typography variant="body1" sx={{ mt: 1, color: 'text.primary' }}>
+                      {box.empty ? 'No insight for this slot yet.' : box.text}
+                    </Typography>
+                  </CardContent>
+                </Card>
+              ))}
+            </Stack>
           </Stack>
-        </Stack>
 
-        <Card elevation={0} sx={{ borderRadius: 3 }}>
-          <CardContent sx={{ p: { xs: 2, md: 3 } }}>
-            <Stack spacing={2.5}>
-              <Stack spacing={0.5}>
-                <Typography variant="h6" color="text.primary">
-                  Smart Usage Timeline
-                </Typography>
-                <Typography variant="body2" color="text.secondary">
-                  Drag to move • Resize edges • Snaps to hour on release
-                </Typography>
-              </Stack>
-
-              <Stack direction="row" spacing={2} alignItems="flex-end">
-                <Box sx={{ width: 72, flexShrink: 0 }} aria-hidden />
-                <Box sx={{ flex: 1, minWidth: 0 }}>
-                  <HourScale />
-                </Box>
-              </Stack>
-
-              <Stack spacing={2}>
-                {(optimizeData?.appliances ?? []).map((app, index) => (
-                  <TimelineRangeBar
-                    key={app.appId}
-                    label={app.name.replaceAll('_', ' ')}
-                    color={SLIDER_ROW_COLORS[index % SLIDER_ROW_COLORS.length]}
-                    applianceId={app.appId}
-                  />
+          {optimizeData?.hasConstrainedRun ? (
+            <Stack spacing={0.5}>
+              <Typography variant="subtitle2" color="text.secondary">
+                Constrained insights
+              </Typography>
+              <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
+                {constrainedInsightRow.map((box) => (
+                  <Card
+                    key={`constrained-${box.key}`}
+                    elevation={0}
+                    sx={{
+                      flex: 1,
+                      borderRadius: 2,
+                      border: '1px solid',
+                      borderColor: 'divider',
+                    }}
+                  >
+                    <CardContent sx={{ py: 2 }}>
+                      <Typography variant="body2" color="text.secondary">
+                        {box.empty ? '—' : box.title}
+                      </Typography>
+                      <Typography variant="body1" sx={{ mt: 1, color: 'text.primary' }}>
+                        {box.empty ? 'No insight for this slot yet.' : box.text}
+                      </Typography>
+                    </CardContent>
+                  </Card>
                 ))}
-                {!isGraphLoading && !graphErrorMessage && (optimizeData?.appliances.length ?? 0) === 0 ? (
-                  <Typography variant="body2" color="text.secondary">
-                    No appliances with usage in this bill cycle; sliders appear when the chart has data.
-                  </Typography>
-                ) : null}
               </Stack>
             </Stack>
-          </CardContent>
-        </Card>
+          ) : null}
+
+          
+        </Stack>
 
         <Card elevation={0} sx={{ borderRadius: 3 }}>
           <CardContent sx={{ p: { xs: 2, md: 3 } }}>
             <Stack spacing={2}>
               <Typography variant="h6" color="text.primary">
-                🧠 Tell us your lifestyle
+                Tell us your lifestyle
               </Typography>
-              <Stack direction="row" spacing={1}>
-                <Button
-                  type="button"
-                  variant={analysisInputMode === 'text' ? 'contained' : 'outlined'}
-                  onClick={() => setAnalysisInputMode('text')}
-                >
-                  Analyze Text
-                </Button>
-                <Button
-                  type="button"
-                  variant={analysisInputMode === 'sliders' ? 'contained' : 'outlined'}
-                  onClick={() => setAnalysisInputMode('sliders')}
-                >
-                  Analyze Sliders
-                </Button>
-              </Stack>
 
-              <Box
-                sx={{
-                  p: 2,
-                  borderRadius: 2,
-                  border: '1.5px solid #5c6bc0',
-                  bgcolor: '#f7f9ff',
-                }}
+              <Tabs
+                value={analysisInputMode}
+                onChange={(_, newValue) => setAnalysisInputMode(newValue as 'text' | 'sliders')}
+                aria-label="Constraint input mode"
+                sx={{ borderBottom: 1, borderColor: 'divider', minHeight: 42 }}
               >
-                <TextField
-                  value={lifestyleInput}
-                  onChange={(event) => setLifestyleInput(event.target.value)}
-                  disabled={analysisInputMode !== 'text'}
-                  fullWidth
-                  multiline
-                  minRows={2}
-                  variant="standard"
-                  placeholder='✨ Start typing... "Charge EV before 7 AM"'
-                  InputProps={{ disableUnderline: true }}
+                <Tab
+                  label="Text"
+                  value="text"
+                  id="lifestyle-tab-text"
+                  aria-controls="lifestyle-panel-text"
                 />
-              </Box>
+                <Tab
+                  label="Sliders"
+                  value="sliders"
+                  id="lifestyle-tab-sliders"
+                  aria-controls="lifestyle-panel-sliders"
+                />
+              </Tabs>
 
-              <Stack direction="row" justifyContent="space-between" alignItems="center">
+              {analysisInputMode === 'text' ? (
+                <Box role="tabpanel" id="lifestyle-panel-text" aria-labelledby="lifestyle-tab-text" sx={{ pt: 1 }}>
+                  <Box
+                    sx={{
+                      p: 2,
+                      borderRadius: 2,
+                      border: '1.5px solid #5c6bc0',
+                      bgcolor: '#f7f9ff',
+                    }}
+                  >
+                    <TextField
+                      value={lifestyleInput}
+                      onChange={(event) => setLifestyleInput(event.target.value)}
+                      fullWidth
+                      multiline
+                      minRows={4}
+                      variant="standard"
+                      placeholder='✨ Start typing... "Charge EV before 7 AM"'
+                      InputProps={{ disableUnderline: true }}
+                    />
+                  </Box>
+                </Box>
+              ) : (
+                <Box
+                  role="tabpanel"
+                  id="lifestyle-panel-sliders"
+                  aria-labelledby="lifestyle-tab-sliders"
+                  sx={{ pt: 1 }}
+                  hidden={false}
+                >
+                  <Stack spacing={2.5}>
+                    <Typography variant="body2" color="text.secondary">
+                      Drag to move • Resize edges • Snaps to hour on release
+                    </Typography>
+
+                    <Stack direction="row" spacing={2} alignItems="flex-end">
+                      <Box sx={{ width: 72, flexShrink: 0 }} aria-hidden />
+                      <Box sx={{ flex: 1, minWidth: 0 }}>
+                        <HourScale />
+                      </Box>
+                    </Stack>
+
+                    <Stack spacing={2}>
+                      {(optimizeData?.appliances ?? []).map((app, index) => (
+                        <TimelineRangeBar
+                          key={app.appId}
+                          label={app.name.replaceAll('_', ' ')}
+                          color={SLIDER_ROW_COLORS[index % SLIDER_ROW_COLORS.length]}
+                          applianceId={app.appId}
+                        />
+                      ))}
+                      {!isGraphLoading && !graphErrorMessage && (optimizeData?.appliances.length ?? 0) === 0 ? (
+                        <Typography variant="body2" color="text.secondary">
+                          No appliances with usage in this bill cycle; sliders appear when the cost chart has data.
+                        </Typography>
+                      ) : null}
+                    </Stack>
+                  </Stack>
+                </Box>
+              )}
+
+              <Stack direction="row" justifyContent="space-between" alignItems="center" flexWrap="wrap" gap={1}>
                 <Typography variant="caption" color="text.secondary">
                   {analysisInputMode === 'text'
-                    ? 'Analyzing only free text input'
-                    : 'Analyzing only slider constraints'}
+                    ? 'Analyze uses your text constraint only.'
+                    : 'Analyze uses your slider windows only.'}
                 </Typography>
                 <Button
                   type="button"

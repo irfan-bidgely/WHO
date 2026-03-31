@@ -1,5 +1,14 @@
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:5000';
 
+/** Stripped load-shift insights object attached to each optimizer branch (`facts` removed server-side). */
+export type LoadShiftInsightsPayload = {
+  appliances?: Array<{
+    appId?: number;
+    name?: string;
+    insight?: string;
+  }>;
+};
+
 /** Per-branch payload from `/api/build-merged-optimize` (baseline vs constrained optimizer run). */
 export type OptimizeBranchBody = {
   total: {
@@ -15,7 +24,7 @@ export type OptimizeBranchBody = {
     savings: { costSavings: number; consumptionSavings: number };
     best: { cost: number; consumption: number };
   }>;
-  insights?: unknown;
+  insights?: LoadShiftInsightsPayload | unknown;
 };
 
 export type BuildMergedOptimizeResponse = {
@@ -58,6 +67,67 @@ export function selectOptimizeBranch(res: BuildMergedOptimizeResponse): Optimize
   return res.constrained ?? res.baseline;
 }
 
+/** One bordered “box” in the Insights section (actual / constrained rows). */
+export type InsightBox = {
+  key: string;
+  title: string;
+  text: string;
+  /** No non-empty insight text for this slot. */
+  empty?: boolean;
+};
+
+function collectInsightsFromBranch(branch: OptimizeBranchBody | null | undefined): Array<{
+  appId: number;
+  name: string;
+  text: string;
+}> {
+  const raw = branch?.insights;
+  if (!raw || typeof raw !== 'object') return [];
+  const appliances = (raw as LoadShiftInsightsPayload).appliances;
+  if (!Array.isArray(appliances)) return [];
+  const out: Array<{ appId: number; name: string; text: string }> = [];
+  for (const row of appliances) {
+    if (!row || typeof row !== 'object') continue;
+    const appId = Number((row as { appId?: unknown }).appId);
+    const name = String((row as { name?: unknown }).name ?? '')
+      .replaceAll('_', ' ')
+      .trim();
+    const text = String((row as { insight?: unknown }).insight ?? '').trim();
+    if (!text) continue;
+    out.push({
+      appId: Number.isFinite(appId) ? appId : out.length,
+      name: name || 'Appliance',
+      text,
+    });
+  }
+  return out;
+}
+
+function padInsightBoxes(
+  items: Array<{ appId: number; name: string; text: string }>,
+  count: number,
+): InsightBox[] {
+  const boxes: InsightBox[] = [];
+  for (let i = 0; i < count; i++) {
+    const item = items[i];
+    if (item) {
+      boxes.push({
+        key: `insight-${item.appId}-${i}`,
+        title: item.name,
+        text: item.text,
+      });
+    } else {
+      boxes.push({
+        key: `insight-empty-${i}`,
+        title: 'Insight',
+        text: '',
+        empty: true,
+      });
+    }
+  }
+  return boxes;
+}
+
 export type OptimizeDisplayState = {
   billCycleStart: number | null;
   billCycleEnd: number | null;
@@ -68,6 +138,10 @@ export type OptimizeDisplayState = {
   totalConstrainedBestCost: number;
   /** True when API returned a `constrained` branch (user sent constraints). */
   hasConstrainedRun: boolean;
+  /** First two non-empty baseline (best-case) load-shift insights. */
+  actualInsightBoxes: InsightBox[];
+  /** First two non-empty constrained load-shift insights; placeholders when no constrained run. */
+  constrainedInsightBoxes: InsightBox[];
   appliances: Array<{
     appId: number;
     name: string;
@@ -86,6 +160,9 @@ export function buildOptimizeDisplayState(res: BuildMergedOptimizeResponse): Opt
   const co = res.constrained;
   const constrainedByApp = new Map((co?.appliances ?? []).map((a) => [a.appId, a]));
 
+  const baselineInsightList = collectInsightsFromBranch(bl);
+  const constrainedInsightList = collectInsightsFromBranch(co ?? undefined);
+
   return {
     billCycleStart: res.billCycle?.intervalStart ?? null,
     billCycleEnd: res.billCycle?.intervalEnd ?? null,
@@ -93,6 +170,8 @@ export function buildOptimizeDisplayState(res: BuildMergedOptimizeResponse): Opt
     totalBaselineBestCost: bl.total.best.cost,
     totalConstrainedBestCost: co?.total.best.cost ?? bl.total.best.cost,
     hasConstrainedRun: co != null,
+    actualInsightBoxes: padInsightBoxes(baselineInsightList, 2),
+    constrainedInsightBoxes: padInsightBoxes(co != null ? constrainedInsightList : [], 2),
     appliances: bl.appliances
       .filter((appliance) => appliance.current.consumption > 0)
       .map((appliance) => {
