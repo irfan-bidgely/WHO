@@ -9,9 +9,42 @@ from typing import Optional
 
 import requests
 
+
+def _clock_hour_to_24(hour: int, am_pm: Optional[str]) -> int:
+    h = int(hour)
+    ap = (am_pm or "").lower()
+    if ap == "pm" and h < 12:
+        h += 12
+    if ap == "am" and h == 12:
+        h = 0
+    return max(0, min(24, h))
+
 logger = logging.getLogger(__name__)
 
 _OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
+
+
+def half_open_span_hours_from_windows(windows: object) -> int:
+    """
+    Longest contiguous span (hours) implied by each window in half-open [start, end).
+    endHour 24 counts as end-of-day (24) so e.g. 22–24 => span 2.
+    For multiple windows, returns the maximum single-window span (a block must fit
+    entirely in one window).
+    """
+    if not isinstance(windows, list) or not windows:
+        return 0
+    best = 0
+    for w in windows:
+        if not isinstance(w, dict):
+            continue
+        try:
+            s = int(w["startHour"])
+            e = int(w["endHour"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        e_eff = 24 if e >= 24 else e
+        best = max(best, max(1, e_eff - s))
+    return best
 
 CONSTRAINT_ANALYZER_PROMPT_TEMPLATE = """
 You extract scheduling constraints per appliance from user natural language.
@@ -75,29 +108,126 @@ def _infer_appliances(constraint_text: str) -> list[int]:
 def _fallback_parse(constraint_text: str) -> AnalyzeConstraintResult:
     text = constraint_text.lower()
     appliance_ids = _infer_appliances(text) or [18]
+
+    def _for_all(windows: list[dict[str, int]]) -> AnalyzeConstraintResult:
+        span = half_open_span_hours_from_windows(windows)
+        return AnalyzeConstraintResult(
+            appliance_constraints={
+                aid: {
+                    "maxShiftHours": None,
+                    "allowedWindows": windows,
+                    "_halfOpenSpanHours": span,
+                }
+                for aid in appliance_ids
+            }
+        )
+
+    # "between 6am and 9am" / "between 6 and 9"
+    between_m = re.search(
+        r"between\s+(\d{1,2})(?:\s*([ap]m))?\s+and\s+(\d{1,2})(?:\s*([ap]m))?",
+        text,
+    )
+    if between_m:
+        h1 = _clock_hour_to_24(int(between_m.group(1)), between_m.group(2))
+        h2 = _clock_hour_to_24(int(between_m.group(3)), between_m.group(4))
+        lo, hi = (h1, h2) if h1 <= h2 else (h2, h1)
+        return _for_all([{"startHour": lo, "endHour": hi}])
+
+    # "before 2 am" / "before 2:30 am" (minutes ignored; end hour uses clock hour)
+    before_m = re.search(
+        r"before\s+(\d{1,2})(?:\s*:\s*\d{2})?\s*([ap]m)?",
+        text,
+    )
+    if before_m:
+        end_h = _clock_hour_to_24(int(before_m.group(1)), before_m.group(2))
+        return _for_all([{"startHour": 0, "endHour": end_h}])
+
+    # "after 10 pm" / "after 10"
+    after_m = re.search(
+        r"after\s+(\d{1,2})(?:\s*:\s*\d{2})?\s*([ap]m)?",
+        text,
+    )
+    if after_m:
+        start_h = _clock_hour_to_24(int(after_m.group(1)), after_m.group(2))
+        return _for_all([{"startHour": start_h, "endHour": 24}])
+
     by_match = re.search(r"by\s+(\d{1,2})(?:\s*:\s*(\d{2}))?\s*(am|pm)?", text)
     if by_match:
         hour = int(by_match.group(1))
         am_pm = by_match.group(3)
-        if am_pm == "pm" and hour < 12:
-            hour += 12
-        if am_pm == "am" and hour == 12:
-            hour = 0
-        hour = max(0, min(24, hour))
-        constraints = {
-            appliance_id: {
-                "maxShiftHours": None,
-                "allowedWindows": [{"startHour": 0, "endHour": hour}],
-            }
-            for appliance_id in appliance_ids
-        }
-        return AnalyzeConstraintResult(appliance_constraints=constraints)
+        hour = _clock_hour_to_24(hour, am_pm)
+        return _for_all([{"startHour": 0, "endHour": hour}])
 
     constraints = {
         appliance_id: {"maxShiftHours": None, "allowedWindows": None}
         for appliance_id in appliance_ids
     }
     return AnalyzeConstraintResult(appliance_constraints=constraints)
+
+
+def merge_fallback_where_windows_missing(
+    constraint_text: str,
+    constraints: dict[int, dict[str, object]],
+    *,
+    shiftable_appliance_ids: list[int],
+) -> dict[int, dict[str, object]]:
+    """
+    If LLM (or prior step) left allowedWindows/maxShiftHours empty for an appliance,
+    fill from rule-based fallback so phrases like "before 2 AM" still work.
+    """
+    fb = _fallback_parse(constraint_text).appliance_constraints
+    out = dict(constraints)
+    for aid in list(out.keys()):
+        if aid not in shiftable_appliance_ids:
+            continue
+        c = out[aid]
+        win = c.get("allowedWindows")
+        msh = c.get("maxShiftHours")
+        has_window = win is not None and isinstance(win, list) and len(win) > 0
+        has_shift = msh is not None
+        if has_window or has_shift:
+            continue
+        if aid in fb:
+            out[aid] = dict(fb[aid])
+    # Also add appliances that fallback inferred but LLM omitted entirely
+    for aid, fc in fb.items():
+        if aid not in out and aid in shiftable_appliance_ids:
+            fw = fc.get("allowedWindows")
+            if fw is not None and isinstance(fw, list) and len(fw) > 0:
+                out[aid] = dict(fc)
+    return out
+
+
+def filter_constraints_to_inferred_appliances(
+    constraint_text: str,
+    constraints: dict[int, dict[str, object]],
+    *,
+    shiftable_appliance_ids: list[int],
+) -> dict[int, dict[str, object]]:
+    """
+    For natural-language input, drop appliances the model invented that are not
+    referenced in the text (e.g. AC when user only said "Charge EV before 2 AM").
+    If inference finds nothing, leave ``constraints`` unchanged (trust LLM / payload).
+    """
+    text = (constraint_text or "").strip().lower()
+    if not text:
+        return constraints
+    inferred = set(_infer_appliances(text))
+    if not inferred:
+        return constraints
+    filtered = {
+        int(k): v
+        for k, v in constraints.items()
+        if int(k) in inferred and int(k) in shiftable_appliance_ids
+    }
+    if filtered:
+        return filtered
+    fb = _fallback_parse(constraint_text).appliance_constraints
+    return {
+        k: v
+        for k, v in fb.items()
+        if k in shiftable_appliance_ids and k in inferred
+    }
 
 
 def analyze_constraint_text(
@@ -175,9 +305,27 @@ def analyze_constraint_text(
                 end_hour = int(window["endHour"])
                 normalized_windows.append({"startHour": start_hour, "endHour": end_hour})
 
-        normalized_constraints[appliance_id] = {
+        entry: dict[str, object] = {
             "maxShiftHours": max_shift_hours,
             "allowedWindows": normalized_windows,
         }
+        if normalized_windows:
+            entry["_halfOpenSpanHours"] = half_open_span_hours_from_windows(
+                normalized_windows
+            )
+        normalized_constraints[appliance_id] = entry
 
-    return AnalyzeConstraintResult(appliance_constraints=normalized_constraints)
+    if not normalized_constraints:
+        fb = _fallback_parse(constraint_text)
+        normalized_constraints = {
+            k: v
+            for k, v in fb.appliance_constraints.items()
+            if k in shiftable_appliance_ids
+        }
+
+    merged = merge_fallback_where_windows_missing(
+        constraint_text,
+        normalized_constraints,
+        shiftable_appliance_ids=shiftable_appliance_ids,
+    )
+    return AnalyzeConstraintResult(appliance_constraints=merged)
