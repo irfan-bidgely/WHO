@@ -15,7 +15,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-SHIFTABLE_APPLIANCE_IDS = [18, 2, 3, 4, 7]
+SHIFTABLE_APPLIANCE_IDS = [18, 2, 3, 4, 7, 30]
 
 
 def _load_appliance_catalog() -> dict[int, str]:
@@ -38,8 +38,15 @@ class BlockConstraints(BaseModel):
     allowedWindows: Optional[list[AllowedWindow]] = None
 
 
+class ApplianceTimeConstraint(BaseModel):
+    appliance_id: int
+    load_start_time: str
+    load_end_time: str
+
+
 class AnalyzeConstraintRequest(BaseModel):
-    constraintText: str = Field(min_length=1)
+    constraintText: Optional[str] = None
+    constraints: Optional[list[ApplianceTimeConstraint]] = None
 
 
 class ApplianceConstraint(BaseModel):
@@ -49,6 +56,38 @@ class ApplianceConstraint(BaseModel):
 
 class AnalyzeConstraintResponse(BaseModel):
     applianceConstraints: list[ApplianceConstraint]
+
+
+def _time_to_hour(value: str) -> int:
+    text = value.strip()
+    if ":" in text:
+        hour_part = text.split(":", maxsplit=1)[0]
+        hour = int(hour_part)
+    else:
+        hour = int(text)
+    if hour < 0 or hour > 24:
+        raise ValueError("Hour out of range")
+    return hour
+
+
+def _constraints_from_payload(
+    constraints: Optional[list[ApplianceTimeConstraint]],
+    *,
+    shiftable_appliance_ids: list[int],
+) -> dict[int, dict[str, object]]:
+    if not constraints:
+        return {}
+    normalized: dict[int, dict[str, object]] = {}
+    for block in constraints:
+        if block.appliance_id not in shiftable_appliance_ids:
+            continue
+        start_hour = _time_to_hour(block.load_start_time)
+        end_hour = _time_to_hour(block.load_end_time)
+        normalized[block.appliance_id] = {
+            "maxShiftHours": None,
+            "allowedWindows": [{"startHour": start_hour, "endHour": end_hour}],
+        }
+    return normalized
 
 
 @app.after_request
@@ -79,14 +118,33 @@ def analyze_constraint():
     except ValidationError as exc:
         return jsonify({"error": "Invalid request", "details": exc.errors()}), 400
 
+    if not (payload.constraintText and payload.constraintText.strip()) and not payload.constraints:
+        return jsonify({"error": "Invalid request", "details": "Provide constraintText or constraints"}), 400
+
     try:
-        result = analyze_constraint_text(
-            payload.constraintText,
+        payload_constraints = _constraints_from_payload(
+            payload.constraints,
             shiftable_appliance_ids=SHIFTABLE_APPLIANCE_IDS,
-            appliance_catalog=APPLIANCE_CATALOG,
         )
+    except ValueError as exc:
+        return jsonify({"error": "Invalid request", "details": str(exc)}), 400
+
+    try:
+        text_constraints: dict[int, dict[str, object]] = {}
+        if payload.constraintText and payload.constraintText.strip():
+            text_result = analyze_constraint_text(
+                payload.constraintText.strip(),
+                shiftable_appliance_ids=SHIFTABLE_APPLIANCE_IDS,
+                appliance_catalog=APPLIANCE_CATALOG,
+            )
+            text_constraints = text_result.appliance_constraints
+
+        # Text-derived constraints take precedence for the same appliance id.
+        merged_constraints = dict(payload_constraints)
+        merged_constraints.update(text_constraints)
+
         appliance_constraints: list[ApplianceConstraint] = []
-        for appliance_id, block in result.appliance_constraints.items():
+        for appliance_id, block in merged_constraints.items():
             appliance_constraints.append(
                 ApplianceConstraint(
                     applianceId=appliance_id,

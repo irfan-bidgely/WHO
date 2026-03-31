@@ -3,7 +3,12 @@ import type { BlockConstraints } from './whoSlice';
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:5000';
 
 type AnalyzeConstraintRequest = {
-  constraintText: string;
+  constraintText?: string;
+  constraints?: Array<{
+    appliance_id: number;
+    load_start_time: string;
+    load_end_time: string;
+  }>;
 };
 
 type AnalyzeConstraintResponse = {
