@@ -1,21 +1,40 @@
-import { useEffect, useId, useMemo, useState } from 'react';
+import { useEffect, useId, useLayoutEffect, useMemo, useState } from 'react';
 import Card from '@mui/material/Card';
 import CardContent from '@mui/material/CardContent';
 import Box from '@mui/material/Box';
 import Button from '@mui/material/Button';
+import CircularProgress from '@mui/material/CircularProgress';
 import Divider from '@mui/material/Divider';
 import Paper from '@mui/material/Paper';
 import Stack from '@mui/material/Stack';
 import TextField from '@mui/material/TextField';
 import Typography from '@mui/material/Typography';
-import { analyzeConstraint } from '../features/who/analyzeConstraintApi';
-import { fetchBuildMergedOptimize } from '../features/who/buildMergedOptimizeApi';
-import { applyConstraintWindow, type TimelineApplianceId } from '../features/who/whoSlice';
+import {
+  buildOptimizeDisplayState,
+  fetchBuildMergedOptimize,
+} from '../features/who/buildMergedOptimizeApi';
+import { defaultTimelineRangeForAppId, syncTimelineForAppIds } from '../features/who/whoSlice';
 import { useAppDispatch, useAppSelector } from '../store/hooks';
 import { HourScale } from './HourScale';
 import { TimelineRangeBar } from './TimelineRangeBar';
 
 const DEFAULT_OPTIMIZER_UUID = '9d1df24f-f902-45ac-b3f4-a711dd57c0a5';
+
+const SLIDER_ROW_COLORS = ['#1976d2', '#ef6c00', '#6a1b9a', '#2e7d32', '#7b1fa2'];
+
+const usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });
+
+function formatUsd(value: number): string {
+  return usd.format(value);
+}
+
+function readOptimizerRequestParams() {
+  const uuid =
+    (import.meta.env.VITE_OPTIMIZER_UUID as string | undefined)?.trim() || DEFAULT_OPTIMIZER_UUID;
+  const userUuid = (import.meta.env.VITE_OPTIMIZER_USER_UUID as string | undefined)?.trim() ?? '';
+  const timezone = (import.meta.env.VITE_OPTIMIZER_TIMEZONE as string | undefined)?.trim() ?? 'UTC';
+  return { uuid, userUuid, timezone };
+}
 
 /**
  * Primary SPA surface: WHO content and state wired through Redux Toolkit.
@@ -33,20 +52,31 @@ export function WhoWidget() {
   const [analysisSuccessMessage, setAnalysisSuccessMessage] = useState<string | null>(null);
   const [analysisErrorMessage, setAnalysisErrorMessage] = useState<string | null>(null);
   const [optimizeData, setOptimizeData] = useState<{
+    billCycleStart: number | null;
+    billCycleEnd: number | null;
     totalCurrentCost: number;
-    totalBestCost: number;
-    appliances: Array<{ appId: number; name: string; currentCost: number; bestCost: number; costSavings: number }>;
+    totalBaselineBestCost: number;
+    totalConstrainedBestCost: number;
+    hasConstrainedRun: boolean;
+    appliances: Array<{
+      appId: number;
+      name: string;
+      insight?: string;
+      currentCost: number;
+      currentConsumption: number;
+      baselineBestCost: number;
+      constrainedBestCost: number;
+      costSavings: number;
+    }>;
   } | null>(null);
-  const applianceIdToTimelineId: Record<number, TimelineApplianceId | undefined> = {
-    18: 'ev',
-    4: 'ac',
-    30: 'laundry',
-  };
-  const timelineIdToApplianceId: Record<TimelineApplianceId, number> = {
-    ev: 18,
-    ac: 4,
-    laundry: 30,
-  };
+
+  useLayoutEffect(() => {
+    if (!optimizeData?.appliances.length) {
+      dispatch(syncTimelineForAppIds([]));
+      return;
+    }
+    dispatch(syncTimelineForAppIds(optimizeData.appliances.map((a) => a.appId)));
+  }, [optimizeData, dispatch]);
 
   const pctToTimeString = (pct: number): string => {
     const totalMinutes = Math.round((pct / 100) * 24 * 60);
@@ -63,13 +93,14 @@ export function WhoWidget() {
 
   const handleAnalyzeConstraints = async () => {
     const trimmedText = lifestyleInput.trim();
-    const sliderConstraints = (Object.entries(timeline) as Array<[TimelineApplianceId, typeof timeline.ev]>).map(
-      ([timelineId, range]) => ({
-        appliance_id: timelineIdToApplianceId[timelineId],
+    const sliderConstraints = (optimizeData?.appliances ?? []).map((a) => {
+      const range = timeline[a.appId] ?? defaultTimelineRangeForAppId(a.appId);
+      return {
+        appliance_id: a.appId,
         load_start_time: pctToTimeString(range.startPct),
         load_end_time: pctToTimeString(range.endPct),
-      }),
-    );
+      };
+    });
 
     if (analysisInputMode === 'text' && !trimmedText) {
       setAnalysisSuccessMessage(null);
@@ -77,34 +108,35 @@ export function WhoWidget() {
       return;
     }
 
+    if (analysisInputMode === 'sliders' && sliderConstraints.length === 0) {
+      setAnalysisSuccessMessage(null);
+      setAnalysisErrorMessage('Load appliance data first (same list as the chart above).');
+      return;
+    }
+
     setIsAnalyzing(true);
     setAnalysisSuccessMessage(null);
     setAnalysisErrorMessage(null);
+
+    const { uuid, userUuid, timezone } = readOptimizerRequestParams();
+    setIsGraphLoading(true);
+    setGraphErrorMessage(null);
+
     try {
-      const result = await analyzeConstraint(
-        analysisInputMode === 'text'
+      const optimizeResult = await fetchBuildMergedOptimize({
+        uuid,
+        userUuid: userUuid || undefined,
+        timezone,
+        ...(analysisInputMode === 'text'
           ? { constraintText: trimmedText }
-          : { constraints: sliderConstraints },
-      );
-
-      let appliedCount = 0;
-      for (const appliance of result.applianceConstraints) {
-        const timelineId = applianceIdToTimelineId[appliance.applianceId];
-        if (!timelineId) continue;
-        const firstWindow = appliance.blockConstraints.allowedWindows?.[0];
-        if (!firstWindow) continue;
-        dispatch(applyConstraintWindow({ id: timelineId, window: firstWindow }));
-        appliedCount += 1;
-      }
-
-      if (appliedCount === 0) {
-        setAnalysisErrorMessage('No allowed window found in the analyzed constraints.');
-      } else {
-        setAnalysisSuccessMessage(`Applied constraints to ${appliedCount} appliance(s).`);
-      }
+          : { constraints: { constraints: sliderConstraints } }),
+      });
+      setOptimizeData(buildOptimizeDisplayState(optimizeResult));
+      setAnalysisSuccessMessage('Optimization updated with your constraints.');
     } catch {
-      setAnalysisErrorMessage('Could not analyze constraints. Please try again.');
+      setGraphErrorMessage('Unable to load optimization graph data.');
     } finally {
+      setIsGraphLoading(false);
       setIsAnalyzing(false);
     }
   };
@@ -115,27 +147,14 @@ export function WhoWidget() {
       setIsGraphLoading(true);
       setGraphErrorMessage(null);
       try {
-        const uuid =
-          (import.meta.env.VITE_OPTIMIZER_UUID as string | undefined)?.trim() || DEFAULT_OPTIMIZER_UUID;
-        const userUuid = (import.meta.env.VITE_OPTIMIZER_USER_UUID as string | undefined)?.trim() ?? '';
-        const timezone = (import.meta.env.VITE_OPTIMIZER_TIMEZONE as string | undefined)?.trim() ?? 'UTC';
+        const { uuid, userUuid, timezone } = readOptimizerRequestParams();
         const result = await fetchBuildMergedOptimize({
           uuid,
           userUuid: userUuid || undefined,
           timezone,
         });
         if (cancelled) return;
-        setOptimizeData({
-          totalCurrentCost: result.total.current.cost,
-          totalBestCost: result.total.best.cost,
-          appliances: result.appliances.map((appliance) => ({
-            appId: appliance.appId,
-            name: appliance.name,
-            currentCost: appliance.current.cost,
-            bestCost: appliance.best.cost,
-            costSavings: appliance.savings.costSavings,
-          })),
-        });
+        setOptimizeData(buildOptimizeDisplayState(result));
       } catch {
         if (cancelled) return;
         setGraphErrorMessage('Unable to load optimization graph data.');
@@ -150,6 +169,8 @@ export function WhoWidget() {
     };
   }, []);
 
+  const showConstrainedBar = optimizeData?.hasConstrainedRun ?? false;
+
   const chartData = useMemo(
     () => {
       const mapped =
@@ -157,29 +178,60 @@ export function WhoWidget() {
           .map((appliance) => ({
             label: appliance.name.replaceAll('_', ' '),
             actualCost: appliance.currentCost,
-            optimizedCost: appliance.bestCost,
+            baselineBestCost: appliance.baselineBestCost,
+            constrainedBestCost: appliance.constrainedBestCost,
           }))
-          .sort(
-            (a, b) =>
-              Math.max(b.actualCost, b.optimizedCost) - Math.max(a.actualCost, a.optimizedCost),
-          )
+          .sort((a, b) => {
+            const maxA = showConstrainedBar
+              ? Math.max(a.actualCost, a.baselineBestCost, a.constrainedBestCost)
+              : Math.max(a.actualCost, a.baselineBestCost);
+            const maxB = showConstrainedBar
+              ? Math.max(b.actualCost, b.baselineBestCost, b.constrainedBestCost)
+              : Math.max(b.actualCost, b.baselineBestCost);
+            return maxB - maxA;
+          })
           .slice(0, 5) ?? [];
-      const maxCost = Math.max(1, ...mapped.map((item) => Math.max(item.actualCost, item.optimizedCost)));
+      const maxCost = Math.max(
+        1,
+        ...mapped.map((item) =>
+          showConstrainedBar
+            ? Math.max(item.actualCost, item.baselineBestCost, item.constrainedBestCost)
+            : Math.max(item.actualCost, item.baselineBestCost),
+        ),
+      );
       const maxBarHeight = 160;
+      const barHeight = (value: number) =>
+        value > 0 ? Math.max(6, (value / maxCost) * maxBarHeight) : 0;
       return mapped.map((item) => ({
         label: item.label,
-        actual:
-          item.actualCost > 0
-            ? Math.max(6, (item.actualCost / maxCost) * maxBarHeight)
-            : 0,
-        optimized:
-          item.optimizedCost > 0
-            ? Math.max(6, (item.optimizedCost / maxCost) * maxBarHeight)
-            : 0,
+        actual: barHeight(item.actualCost),
+        baselineBest: barHeight(item.baselineBestCost),
+        constrainedBest: showConstrainedBar ? barHeight(item.constrainedBestCost) : 0,
         actualCost: item.actualCost,
-        optimizedCost: item.optimizedCost,
+        baselineBestCost: item.baselineBestCost,
+        constrainedBestCost: item.constrainedBestCost,
       }));
     },
+    [optimizeData, showConstrainedBar],
+  );
+
+  const billCycleLabel = useMemo(() => {
+    if (!optimizeData?.billCycleStart || !optimizeData.billCycleEnd) return null;
+    const start = new Date(optimizeData.billCycleStart * 1000);
+    const end = new Date(optimizeData.billCycleEnd * 1000);
+    const fmt = new Intl.DateTimeFormat('en-US', { day: '2-digit', month: 'short', year: 'numeric' });
+    return `${fmt.format(start)} - ${fmt.format(end)}`;
+  }, [optimizeData]);
+
+  const applianceInsights = useMemo(
+    () =>
+      (optimizeData?.appliances ?? [])
+        .filter((appliance) => Boolean(appliance.insight?.trim()))
+        .map((appliance) => ({
+          key: appliance.appId,
+          title: appliance.name.replaceAll('_', ' '),
+          text: appliance.insight!.trim(),
+        })),
     [optimizeData],
   );
 
@@ -201,31 +253,72 @@ export function WhoWidget() {
       return [
         {
           title: `Top Saver: ${first?.name?.replaceAll('_', ' ') ?? 'N/A'}`,
-          value: `Save Rs ${Number(first?.costSavings ?? 0).toFixed(2)}`,
+          value: `Save ${formatUsd(Number(first?.costSavings ?? 0))}`,
           color: '#2e7d32',
         },
         {
-          title: 'Total Current vs Best',
-          value: `Rs ${optimizeData.totalCurrentCost.toFixed(2)} -> Rs ${optimizeData.totalBestCost.toFixed(2)}`,
+          title: optimizeData.hasConstrainedRun ? 'Total: Actual / Best / Constrained' : 'Total: Actual / Best',
+          value: optimizeData.hasConstrainedRun
+            ? `${formatUsd(optimizeData.totalCurrentCost)} · ${formatUsd(optimizeData.totalBaselineBestCost)} · ${formatUsd(optimizeData.totalConstrainedBestCost)}`
+            : `${formatUsd(optimizeData.totalCurrentCost)} -> ${formatUsd(optimizeData.totalBaselineBestCost)}`,
           color: '#ef6c00',
         },
         {
           title: `Next: ${second?.name?.replaceAll('_', ' ') ?? third?.name?.replaceAll('_', ' ') ?? 'N/A'}`,
-          value: `Save Rs ${Number((second ?? third)?.costSavings ?? 0).toFixed(2)}`,
+          value: `Save ${formatUsd(Number((second ?? third)?.costSavings ?? 0))}`,
           color: '#6a1b9a',
         },
       ];
     },
     [optimizeData],
   );
+  const allInsights = useMemo(() => {
+    const applianceCards = applianceInsights.map((item) => ({
+      title: `${item.title} Insight`,
+      value: item.text,
+      color: '#455a64',
+    }));
+    return [...insights, ...applianceCards];
+  }, [applianceInsights, insights]);
 
   return (
     <Paper
       component="section"
       elevation={0}
-      sx={{ p: { xs: 2, md: 3 }, maxWidth: 1120, mx: 'auto', mt: 2, bgcolor: 'transparent' }}
+      sx={{
+        p: { xs: 2, md: 3 },
+        maxWidth: 1120,
+        mx: 'auto',
+        mt: 2,
+        bgcolor: 'transparent',
+        position: 'relative',
+      }}
       aria-labelledby={titleId}
     >
+      {isGraphLoading ? (
+        <Box
+          sx={{
+            position: 'absolute',
+            inset: 0,
+            zIndex: (theme) => theme.zIndex.modal,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            bgcolor: 'rgba(255,255,255,0.78)',
+            backdropFilter: 'blur(4px)',
+            borderRadius: 0,
+          }}
+          aria-busy="true"
+          aria-live="polite"
+        >
+          <Stack alignItems="center" spacing={1.5}>
+            <CircularProgress size={48} thickness={4} />
+            <Typography variant="body2" color="text.secondary">
+              Loading optimization…
+            </Typography>
+          </Stack>
+        </Box>
+      ) : null}
       <Stack spacing={3}>
         <Typography id={titleId} variant="h4" component="h1" color="text.primary">
           {title}
@@ -234,13 +327,20 @@ export function WhoWidget() {
         <Card elevation={0} sx={{ borderRadius: 3 }}>
           <CardContent sx={{ p: { xs: 2, md: 3 } }}>
             <Stack spacing={2}>
-              <Typography variant="h6" color="text.primary">
-                Cost by Appliance
-              </Typography>
+              <Stack direction="row" justifyContent="space-between" alignItems="center">
+                <Typography variant="h6" color="text.primary">
+                  Cost by Appliance
+                </Typography>
+                {billCycleLabel ? (
+                  <Typography variant="body2" color="text.secondary">
+                    Billing Cycle: {billCycleLabel}
+                  </Typography>
+                ) : null}
+              </Stack>
 
               <Stack direction="row" spacing={3} alignItems="flex-end" sx={{ minHeight: 220 }}>
                 <Stack spacing={3} justifyContent="flex-end" sx={{ minWidth: 40, pb: 4 }}>
-                  {['₹200', '₹100', '₹0'].map((label) => (
+                  {['$200', '$100', '$0'].map((label) => (
                     <Typography key={label} variant="caption" color="text.secondary">
                       {label}
                     </Typography>
@@ -249,44 +349,79 @@ export function WhoWidget() {
 
                 <Divider orientation="vertical" flexItem />
 
-                <Stack direction="row" spacing={{ xs: 3, md: 6 }} alignItems="flex-end" sx={{ pb: 1 }}>
+                <Stack direction="row" spacing={{ xs: 2, md: 4 }} alignItems="flex-end" sx={{ pb: 1 }}>
                   {chartData.map((item) => (
-                    <Stack key={item.label} spacing={1} alignItems="center">
-                      <Stack direction="row" spacing={0.5} alignItems="flex-end" sx={{ height: 160 }}>
-                        <Box sx={{ width: 20, height: item.actual, bgcolor: '#1976d2', borderRadius: 0.5 }} />
-                        <Box sx={{ width: 20, height: item.optimized, bgcolor: '#2e7d32', borderRadius: 0.5 }} />
+                    <Stack key={item.label} spacing={1} alignItems="center" sx={{ maxWidth: 140 }}>
+                      <Stack direction="row" spacing={0.35} alignItems="flex-end" sx={{ height: 160 }}>
+                        <Box
+                          sx={{
+                            width: showConstrainedBar ? 14 : 18,
+                            height: item.actual,
+                            bgcolor: '#1976d2',
+                            borderRadius: 0.5,
+                          }}
+                        />
+                        <Box
+                          sx={{
+                            width: showConstrainedBar ? 14 : 18,
+                            height: item.baselineBest,
+                            bgcolor: '#2e7d32',
+                            borderRadius: 0.5,
+                          }}
+                        />
+                        {showConstrainedBar ? (
+                          <Box
+                            sx={{
+                              width: 14,
+                              height: item.constrainedBest,
+                              bgcolor: '#ed6c02',
+                              borderRadius: 0.5,
+                            }}
+                          />
+                        ) : null}
                       </Stack>
-                      <Typography variant="caption" color="text.secondary">
+                      <Typography variant="caption" color="text.secondary" textAlign="center">
                         {item.label}
                       </Typography>
-                      <Typography variant="caption" color="text.secondary">
-                        Rs {item.actualCost.toFixed(2)} {'->'} Rs {item.optimizedCost.toFixed(2)}
+                      <Typography variant="caption" color="text.secondary" textAlign="center" sx={{ lineHeight: 1.35 }}>
+                        {showConstrainedBar ? (
+                          <>
+                            {formatUsd(item.actualCost)} · {formatUsd(item.baselineBestCost)} ·{' '}
+                            {formatUsd(item.constrainedBestCost)}
+                          </>
+                        ) : (
+                          <>
+                            {formatUsd(item.actualCost)} {'->'} {formatUsd(item.baselineBestCost)}
+                          </>
+                        )}
                       </Typography>
                     </Stack>
                   ))}
                 </Stack>
-
-                <Stack spacing={1} sx={{ ml: 'auto' }}>
-                  <Stack direction="row" spacing={1} alignItems="center">
-                    <Box sx={{ width: 12, height: 12, bgcolor: '#1976d2' }} />
-                    <Typography variant="body2" color="text.secondary">
-                      Actual
-                    </Typography>
-                  </Stack>
-                  <Stack direction="row" spacing={1} alignItems="center">
-                    <Box sx={{ width: 12, height: 12, bgcolor: '#2e7d32' }} />
-                    <Typography variant="body2" color="text.secondary">
-                      Optimized
-                    </Typography>
-                  </Stack>
+              </Stack>
+              <Stack direction="row" spacing={2} alignItems="center" sx={{ flexWrap: 'wrap', gap: 1 }}>
+                <Stack direction="row" spacing={1} alignItems="center">
+                  <Box sx={{ width: 12, height: 12, bgcolor: '#1976d2' }} />
+                  <Typography variant="body2" color="text.secondary">
+                    Actual
+                  </Typography>
                 </Stack>
+                <Stack direction="row" spacing={1} alignItems="center">
+                  <Box sx={{ width: 12, height: 12, bgcolor: '#2e7d32' }} />
+                  <Typography variant="body2" color="text.secondary">
+                    Best
+                  </Typography>
+                </Stack>
+                {showConstrainedBar ? (
+                  <Stack direction="row" spacing={1} alignItems="center">
+                    <Box sx={{ width: 12, height: 12, bgcolor: '#ed6c02' }} />
+                    <Typography variant="body2" color="text.secondary">
+                      Constrained
+                    </Typography>
+                  </Stack>
+                ) : null}
               </Stack>
             </Stack>
-            {isGraphLoading ? (
-              <Typography variant="caption" color="text.secondary">
-                Loading graph data...
-              </Typography>
-            ) : null}
             {graphErrorMessage ? (
               <Typography variant="caption" color="error.main">
                 {graphErrorMessage}
@@ -300,7 +435,7 @@ export function WhoWidget() {
             Insights
           </Typography>
           <Stack direction={{ xs: 'column', md: 'row' }} spacing={2}>
-            {insights.map((item) => (
+            {allInsights.map((item) => (
               <Card key={item.title} elevation={0} sx={{ flex: 1, borderRadius: 3 }}>
                 <CardContent>
                   <Typography variant="body2" color="text.secondary">
@@ -335,9 +470,19 @@ export function WhoWidget() {
               </Stack>
 
               <Stack spacing={2}>
-                <TimelineRangeBar label="EV" color="#1976d2" applianceId="ev" />
-                <TimelineRangeBar label="AC" color="#ef6c00" applianceId="ac" />
-                <TimelineRangeBar label="Laundry" color="#6a1b9a" applianceId="laundry" />
+                {(optimizeData?.appliances ?? []).map((app, index) => (
+                  <TimelineRangeBar
+                    key={app.appId}
+                    label={app.name.replaceAll('_', ' ')}
+                    color={SLIDER_ROW_COLORS[index % SLIDER_ROW_COLORS.length]}
+                    applianceId={app.appId}
+                  />
+                ))}
+                {!isGraphLoading && !graphErrorMessage && (optimizeData?.appliances.length ?? 0) === 0 ? (
+                  <Typography variant="body2" color="text.secondary">
+                    No appliances with usage in this bill cycle; sliders appear when the chart has data.
+                  </Typography>
+                ) : null}
               </Stack>
             </Stack>
           </CardContent>

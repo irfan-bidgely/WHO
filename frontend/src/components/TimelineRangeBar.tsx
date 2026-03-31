@@ -5,10 +5,7 @@ import Tooltip from '@mui/material/Tooltip';
 import Typography from '@mui/material/Typography';
 import { alpha } from '@mui/material/styles';
 import { useStore } from 'react-redux';
-import {
-  setTimelineRange,
-  type TimelineApplianceId,
-} from '../features/who/whoSlice';
+import { defaultTimelineRangeForAppId, setTimelineRange } from '../features/who/whoSlice';
 import type { RootState } from '../store/store';
 import { useAppDispatch, useAppSelector } from '../store/hooks';
 import { formatPctRangeLabel, snapPctToHour } from '../utils/timeScale';
@@ -30,13 +27,15 @@ type DragState = {
 type Props = {
   label: string;
   color: string;
-  applianceId: TimelineApplianceId;
+  /** Dashboard / optimizer appliance id (same as graph rows). */
+  applianceId: number;
 };
 
 export function TimelineRangeBar({ label, color, applianceId }: Props) {
   const dispatch = useAppDispatch();
   const store = useStore<RootState>();
-  const { startPct, endPct } = useAppSelector((s) => s.who.timeline[applianceId]);
+  const stored = useAppSelector((s) => s.who.timeline[applianceId]);
+  const { startPct, endPct } = stored ?? defaultTimelineRangeForAppId(applianceId);
   const trackRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<DragState | null>(null);
 
@@ -48,7 +47,8 @@ export function TimelineRangeBar({ label, color, applianceId }: Props) {
   );
 
   const snapCurrentRangeToHour = useCallback(() => {
-    const { startPct: s, endPct: e } = store.getState().who.timeline[applianceId];
+    const { startPct: s, endPct: e } =
+      store.getState().who.timeline[applianceId] ?? defaultTimelineRangeForAppId(applianceId);
     dispatch(
       setTimelineRange({
         id: applianceId,
