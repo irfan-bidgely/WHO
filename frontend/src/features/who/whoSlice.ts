@@ -8,6 +8,16 @@ export type TimelineRange = {
   endPct: number;
 };
 
+export type AllowedWindow = {
+  startHour: number;
+  endHour: number;
+};
+
+export type BlockConstraints = {
+  maxShiftHours: number | null;
+  allowedWindows: AllowedWindow[] | null;
+};
+
 export type WhoState = {
   /** Display label for the widget header */
   title: string;
@@ -61,8 +71,20 @@ export const whoSlice = createSlice({
       const { id, startPct, endPct } = action.payload;
       state.timeline[id] = clampRange(startPct, endPct);
     },
+    applyConstraintWindow: (
+      state,
+      action: PayloadAction<{
+        id: TimelineApplianceId;
+        window: AllowedWindow;
+      }>,
+    ) => {
+      const { id, window } = action.payload;
+      const startPct = (window.startHour / 24) * 100;
+      const endPct = (window.endHour / 24) * 100;
+      state.timeline[id] = clampRange(startPct, endPct);
+    },
   },
 });
 
-export const { setTitle, setTimelineRange } = whoSlice.actions;
+export const { setTitle, setTimelineRange, applyConstraintWindow } = whoSlice.actions;
 export default whoSlice.reducer;
