@@ -28,7 +28,9 @@ def load_shift_insights():
     """
     POST body: JSON from the external load-shift API.
 
-    Query ``include_facts=1`` to include structured facts used for prompting.
+    Response JSON includes ``metadata`` (echoed scope), ``appliances`` (``insight`` only if
+    monthly savings > 0 for that row), ``source`` (``gemini`` | ``openai`` | ``deterministic``),
+    and optionally ``facts`` when ``include_facts=1``.
     """
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
