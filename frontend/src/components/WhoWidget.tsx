@@ -13,6 +13,7 @@ import CardContent from '@mui/material/CardContent';
 import Box from '@mui/material/Box';
 import Button from '@mui/material/Button';
 import CircularProgress from '@mui/material/CircularProgress';
+import Collapse from '@mui/material/Collapse';
 import Paper from '@mui/material/Paper';
 import Stack from '@mui/material/Stack';
 import Tab from '@mui/material/Tab';
@@ -24,6 +25,7 @@ import {
   fetchBuildMergedOptimize,
   type OptimizeDisplayState,
 } from '../features/who/buildMergedOptimizeApi';
+import { ratePlanDisplayName } from '../features/who/ratePlanLabels';
 import { defaultTimelineRangeForAppId, syncTimelineForAppIds } from '../features/who/whoSlice';
 import { useAppDispatch, useAppSelector } from '../store/hooks';
 import { CostApplianceChartCard } from './CostApplianceChartCard';
@@ -35,7 +37,7 @@ const DEFAULT_OPTIMIZER_UUID = '9d1df24f-f902-45ac-b3f4-a711dd57c0a5';
 /** Default merged-rate plan (full dashboard + insights). */
 const PRIMARY_RATE_PLAN = 1;
 /** Extra plans: same constraints as primary; charts only, loaded after the default response. */
-const COMPARISON_RATE_PLANS = [6, 7, 9] as const;
+const COMPARISON_RATE_PLANS = [9, 6, 7] as const;
 
 type AlternatePlanSlot = {
   ratePlan: number;
@@ -132,6 +134,7 @@ export function WhoWidget() {
   const [analysisErrorMessage, setAnalysisErrorMessage] = useState<string | null>(null);
   const [optimizeData, setOptimizeData] = useState<OptimizeDisplayState | null>(null);
   const [alternatePlanSlots, setAlternatePlanSlots] = useState<AlternatePlanSlot[]>(initialAlternateSlots);
+  const [rateComparisonOpen, setRateComparisonOpen] = useState(false);
   const optimizeSuiteAbortRef = useRef<AbortController | null>(null);
   /** Suppress stale `finally` blocks after a newer optimize run supersedes this one. */
   const optimizeLoadGenerationRef = useRef(0);
@@ -156,6 +159,12 @@ export function WhoWidget() {
     }
     dispatch(syncTimelineForAppIds(optimizeData.appliances.map((a) => a.appId)));
   }, [optimizeData, dispatch]);
+
+  useEffect(() => {
+    if (!optimizeData || graphErrorMessage) {
+      setRateComparisonOpen(false);
+    }
+  }, [optimizeData, graphErrorMessage]);
 
   const pctToTimeString = (pct: number): string => {
     const totalMinutes = Math.round((pct / 100) * 24 * 60);
@@ -382,6 +391,94 @@ export function WhoWidget() {
           errorMessage={graphErrorMessage}
         />
 
+        {optimizeData && !graphErrorMessage ? (
+          <Stack alignItems="center" sx={{ pt: 0.5 }}>
+            <Button
+              type="button"
+              variant="contained"
+              onClick={() => setRateComparisonOpen((open) => !open)}
+              aria-expanded={rateComparisonOpen}
+              aria-controls="rate-plan-comparison-panel"
+              id="rate-plan-comparison-toggle"
+              sx={{
+                px: 2.5,
+                py: 1.25,
+                borderRadius: 3,
+                textTransform: 'none',
+                fontWeight: 600,
+                bgcolor: '#5c6bc0',
+                position: 'relative',
+                overflow: 'hidden',
+                animation: 'ratePlanCtaGlow 2.4s ease-in-out infinite',
+                '@keyframes ratePlanCtaGlow': {
+                  '0%, 100%': {
+                    boxShadow: '0 0 0 0 rgba(92, 107, 192, 0.55)',
+                    transform: 'scale(1)',
+                  },
+                  '45%': {
+                    boxShadow: '0 0 0 10px rgba(92, 107, 192, 0)',
+                    transform: 'scale(1.02)',
+                  },
+                },
+                '@media (prefers-reduced-motion: reduce)': {
+                  animation: 'none',
+                  '&::after': { display: 'none' },
+                },
+                '&:hover': {
+                  bgcolor: '#3f51b5',
+                  animation: 'none',
+                  boxShadow: 4,
+                },
+                '&::after': {
+                  content: '""',
+                  position: 'absolute',
+                  inset: 0,
+                  background:
+                    'linear-gradient(105deg, transparent 40%, rgba(255,255,255,0.22) 50%, transparent 60%)',
+                  transform: 'translateX(-100%)',
+                  animation: 'ratePlanShimmer 3.5s ease-in-out infinite',
+                },
+                '@keyframes ratePlanShimmer': {
+                  '0%': { transform: 'translateX(-100%)' },
+                  '18%, 100%': { transform: 'translateX(100%)' },
+                },
+              }}
+            >
+              <Box component="span" sx={{ position: 'relative', zIndex: 1 }}>
+                {rateComparisonOpen ? 'Hide other rate plans' : 'Check savings on other Rate Plan'}
+              </Box>
+            </Button>
+          </Stack>
+        ) : null}
+
+        <Collapse in={rateComparisonOpen} timeout="auto">
+          <Stack
+            spacing={2}
+            sx={{ pt: 2 }}
+            id="rate-plan-comparison-panel"
+            role="region"
+            aria-labelledby="rate-plan-comparison-toggle"
+          >
+            <Typography variant="body2" color="text.secondary" textAlign="center">
+              Same usage and constraints as above; bars use each plan&apos;s rates ({COMPARISON_RATE_PLANS.map((id) => ratePlanDisplayName(id)).join(', ')}).
+            </Typography>
+            {optimizeData && !graphErrorMessage
+              ? alternatePlanSlots
+                  .filter((slot) => COMPARISON_PLAN_SET.has(slot.ratePlan))
+                  .map((slot) => (
+                    <CostApplianceChartCard
+                      key={slot.ratePlan}
+                      title={`Cost by appliance — ${ratePlanDisplayName(slot.ratePlan)}`}
+                      optimizeData={slot.status === 'ok' ? slot.data : null}
+                      inlineLoading={slot.status === 'loading'}
+                      errorMessage={slot.status === 'error' ? slot.error : null}
+                      compact
+                    />
+                  ))
+              : null}
+          </Stack>
+        </Collapse>
+
         <Stack spacing={0.5}>
             <Typography variant="subtitle2" color="text.secondary">
               All summaries
@@ -599,20 +696,6 @@ export function WhoWidget() {
           </CardContent>
         </Card>
 
-        {optimizeData && !graphErrorMessage
-          ? alternatePlanSlots
-              .filter((slot) => COMPARISON_PLAN_SET.has(slot.ratePlan))
-              .map((slot) => (
-                <CostApplianceChartCard
-                  key={slot.ratePlan}
-                  title={`Cost by appliance — rate plan ${slot.ratePlan}`}
-                  optimizeData={slot.status === 'ok' ? slot.data : null}
-                  inlineLoading={slot.status === 'loading'}
-                  errorMessage={slot.status === 'error' ? slot.error : null}
-                  compact
-                />
-              ))
-          : null}
       </Stack>
     </Paper>
   );
