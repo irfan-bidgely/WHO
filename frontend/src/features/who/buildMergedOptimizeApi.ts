@@ -28,6 +28,8 @@ export type OptimizeBranchBody = {
 };
 
 export type BuildMergedOptimizeResponse = {
+  /** Echo of request `ratePlan` (default 1). */
+  ratePlan?: number;
   billCycle?: {
     intervalStart?: number;
     intervalEnd?: number;
@@ -50,6 +52,8 @@ export type BuildMergedOptimizeRequest = {
   uuid: string;
   userUuid?: string;
   timezone?: string;
+  /** Utility rate plan for merged rates (default 1 on server). */
+  ratePlan?: number;
   /** Natural-language constraint; backend merges with optional slider constraints. */
   constraintText?: string;
   /** Slider-style constraints; must match backend `{ constraints: [...] }` wrapper. */
@@ -198,11 +202,13 @@ export function buildOptimizeDisplayState(res: BuildMergedOptimizeResponse): Opt
 
 export async function fetchBuildMergedOptimize(
   payload: BuildMergedOptimizeRequest,
+  init?: RequestInit,
 ): Promise<BuildMergedOptimizeResponse> {
   const response = await fetch(`${API_BASE_URL}/api/build-merged-optimize`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
+    ...init,
   });
 
   if (!response.ok) {
