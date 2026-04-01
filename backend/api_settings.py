@@ -8,7 +8,7 @@ No environment variables are used for these values.
 API_BASE_URL = "https://naapi.bidgely.com"
 
 # Bearer token for the rates API
-ACCESS_TOKEN = "7213bc63-44c0-4e2a-8656-a820a7ce79b6"
+ACCESS_TOKEN = "45c31c92-0ba1-4011-b196-d1591e8e3f43"
 
 # Utility id in the rates path: .../utilityId/{UTILITY_ID}
 UTILITY_ID = 10121
