@@ -251,6 +251,9 @@ def build_merged_optimize():
     Build merged payload then call local optimizer FastAPI.
 
     Optimizer URL: http://127.0.0.1:8000/optimize
+
+    Body JSON may include optional ``ratePlan`` (int, default 1) to select the utility rate plan
+    used for ``rateVector`` (e.g. 1 default, or 2, 6, 7, 9). The response echoes ``ratePlan``.
     """
     body = request.get_json(silent=True) or {}
     uuid = (body.get("uuid") or "").strip()
@@ -704,6 +707,7 @@ def build_merged_optimize():
     )
 
     final = {
+        "ratePlan": rate_plan,
         "billCycle": {
             "intervalStart": latest_row.get("intervalStart"),
             "intervalEnd": latest_row.get("intervalEnd"),

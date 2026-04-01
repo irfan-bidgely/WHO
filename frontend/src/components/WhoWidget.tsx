@@ -1,10 +1,19 @@
-import { useEffect, useId, useLayoutEffect, useMemo, useState } from 'react';
+import {
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type Dispatch,
+  type SetStateAction,
+} from 'react';
 import Card from '@mui/material/Card';
 import CardContent from '@mui/material/CardContent';
 import Box from '@mui/material/Box';
 import Button from '@mui/material/Button';
 import CircularProgress from '@mui/material/CircularProgress';
-import Divider from '@mui/material/Divider';
+import Collapse from '@mui/material/Collapse';
 import Paper from '@mui/material/Paper';
 import Stack from '@mui/material/Stack';
 import Tab from '@mui/material/Tab';
@@ -16,12 +25,35 @@ import {
   fetchBuildMergedOptimize,
   type OptimizeDisplayState,
 } from '../features/who/buildMergedOptimizeApi';
+import { ratePlanDisplayName } from '../features/who/ratePlanLabels';
 import { defaultTimelineRangeForAppId, syncTimelineForAppIds } from '../features/who/whoSlice';
 import { useAppDispatch, useAppSelector } from '../store/hooks';
+import { CostApplianceChartCard } from './CostApplianceChartCard';
 import { HourScale } from './HourScale';
 import { TimelineRangeBar } from './TimelineRangeBar';
 
 const DEFAULT_OPTIMIZER_UUID = '9d1df24f-f902-45ac-b3f4-a711dd57c0a5';
+
+/** Default merged-rate plan (full dashboard + insights). */
+const PRIMARY_RATE_PLAN = 1;
+/** Extra plans: same constraints as primary; charts only, loaded after the default response. */
+const COMPARISON_RATE_PLANS = [9, 6, 7] as const;
+
+type AlternatePlanSlot = {
+  ratePlan: number;
+  status: 'idle' | 'loading' | 'ok' | 'error';
+  data: OptimizeDisplayState | null;
+  error: string | null;
+};
+
+function initialAlternateSlots(): AlternatePlanSlot[] {
+  return COMPARISON_RATE_PLANS.map((ratePlan) => ({
+    ratePlan,
+    status: 'idle',
+    data: null,
+    error: null,
+  }));
+}
 
 const SLIDER_ROW_COLORS = ['#1976d2', '#ef6c00', '#6a1b9a', '#2e7d32', '#7b1fa2'];
 
@@ -29,6 +61,52 @@ const usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' 
 
 function formatUsd(value: number): string {
   return usd.format(value);
+}
+
+const COMPARISON_PLAN_SET = new Set<number>(COMPARISON_RATE_PLANS);
+
+function loadComparisonRatePlans(
+  base: Parameters<typeof fetchBuildMergedOptimize>[0],
+  signal: AbortSignal,
+  setSlots: Dispatch<SetStateAction<AlternatePlanSlot[]>>,
+) {
+  // Always rebuild from COMPARISON_RATE_PLANS so removed plans (e.g. 2) never linger after HMR or code changes.
+  setSlots(
+    COMPARISON_RATE_PLANS.map((ratePlan) => ({
+      ratePlan,
+      status: 'loading' as const,
+      data: null,
+      error: null,
+    })),
+  );
+  for (const ratePlan of COMPARISON_RATE_PLANS) {
+    void fetchBuildMergedOptimize({ ...base, ratePlan }, { signal })
+      .then((r) => {
+        if (signal.aborted) return;
+        const display = buildOptimizeDisplayState(r);
+        setSlots((prev) =>
+          prev.map((s) =>
+            s.ratePlan === ratePlan ? { ...s, status: 'ok', data: display, error: null } : s,
+          ),
+        );
+      })
+      .catch((err: unknown) => {
+        if (signal.aborted) return;
+        if (err instanceof DOMException && err.name === 'AbortError') return;
+        setSlots((prev) =>
+          prev.map((s) =>
+            s.ratePlan === ratePlan
+              ? {
+                  ...s,
+                  status: 'error',
+                  data: null,
+                  error: 'Unable to load optimization for this rate plan.',
+                }
+              : s,
+          ),
+        );
+      });
+  }
 }
 
 function readOptimizerRequestParams() {
@@ -55,6 +133,24 @@ export function WhoWidget() {
   const [analysisSuccessMessage, setAnalysisSuccessMessage] = useState<string | null>(null);
   const [analysisErrorMessage, setAnalysisErrorMessage] = useState<string | null>(null);
   const [optimizeData, setOptimizeData] = useState<OptimizeDisplayState | null>(null);
+  const [alternatePlanSlots, setAlternatePlanSlots] = useState<AlternatePlanSlot[]>(initialAlternateSlots);
+  const [rateComparisonOpen, setRateComparisonOpen] = useState(false);
+  const optimizeSuiteAbortRef = useRef<AbortController | null>(null);
+  /** Suppress stale `finally` blocks after a newer optimize run supersedes this one. */
+  const optimizeLoadGenerationRef = useRef(0);
+
+  useEffect(() => {
+    setAlternatePlanSlots((prev) => {
+      const onlyAllowed = prev.filter((s) => COMPARISON_PLAN_SET.has(s.ratePlan));
+      if (
+        onlyAllowed.length === prev.length &&
+        onlyAllowed.length === COMPARISON_RATE_PLANS.length
+      ) {
+        return prev;
+      }
+      return initialAlternateSlots();
+    });
+  }, []);
 
   useLayoutEffect(() => {
     if (!optimizeData?.appliances.length) {
@@ -63,6 +159,12 @@ export function WhoWidget() {
     }
     dispatch(syncTimelineForAppIds(optimizeData.appliances.map((a) => a.appId)));
   }, [optimizeData, dispatch]);
+
+  useEffect(() => {
+    if (!optimizeData || graphErrorMessage) {
+      setRateComparisonOpen(false);
+    }
+  }, [optimizeData, graphErrorMessage]);
 
   const pctToTimeString = (pct: number): string => {
     const totalMinutes = Math.round((pct / 100) * 24 * 60);
@@ -108,98 +210,76 @@ export function WhoWidget() {
     setIsGraphLoading(true);
     setGraphErrorMessage(null);
 
+    const baseRequest = {
+      uuid,
+      userUuid: userUuid || undefined,
+      timezone,
+      ratePlan: PRIMARY_RATE_PLAN,
+      ...(analysisInputMode === 'text'
+        ? { constraintText: trimmedText }
+        : { constraints: { constraints: sliderConstraints } }),
+    };
+
+    optimizeSuiteAbortRef.current?.abort();
+    const ac = new AbortController();
+    optimizeSuiteAbortRef.current = ac;
+    const loadGen = ++optimizeLoadGenerationRef.current;
+
     try {
-      const optimizeResult = await fetchBuildMergedOptimize({
-        uuid,
-        userUuid: userUuid || undefined,
-        timezone,
-        ...(analysisInputMode === 'text'
-          ? { constraintText: trimmedText }
-          : { constraints: { constraints: sliderConstraints } }),
-      });
+      const optimizeResult = await fetchBuildMergedOptimize(baseRequest, { signal: ac.signal });
+      if (ac.signal.aborted || loadGen !== optimizeLoadGenerationRef.current) return;
       setOptimizeData(buildOptimizeDisplayState(optimizeResult));
       setAnalysisSuccessMessage('Optimization updated with your constraints.');
+      loadComparisonRatePlans(baseRequest, ac.signal, setAlternatePlanSlots);
     } catch {
+      if (ac.signal.aborted || loadGen !== optimizeLoadGenerationRef.current) return;
       setGraphErrorMessage('Unable to load optimization graph data.');
+      setAlternatePlanSlots(initialAlternateSlots());
     } finally {
-      setIsGraphLoading(false);
-      setIsAnalyzing(false);
+      if (loadGen === optimizeLoadGenerationRef.current) {
+        setIsGraphLoading(false);
+        setIsAnalyzing(false);
+      }
     }
   };
 
   useEffect(() => {
-    let cancelled = false;
+    optimizeSuiteAbortRef.current?.abort();
+    const ac = new AbortController();
+    optimizeSuiteAbortRef.current = ac;
+    const loadGen = ++optimizeLoadGenerationRef.current;
+
     const loadGraphData = async () => {
       setIsGraphLoading(true);
       setGraphErrorMessage(null);
       try {
         const { uuid, userUuid, timezone } = readOptimizerRequestParams();
-        const result = await fetchBuildMergedOptimize({
+        const baseRequest = {
           uuid,
           userUuid: userUuid || undefined,
           timezone,
-        });
-        if (cancelled) return;
+          ratePlan: PRIMARY_RATE_PLAN,
+        };
+        const result = await fetchBuildMergedOptimize(baseRequest, { signal: ac.signal });
+        if (ac.signal.aborted || loadGen !== optimizeLoadGenerationRef.current) return;
         setOptimizeData(buildOptimizeDisplayState(result));
+        loadComparisonRatePlans(baseRequest, ac.signal, setAlternatePlanSlots);
       } catch {
-        if (cancelled) return;
+        if (ac.signal.aborted || loadGen !== optimizeLoadGenerationRef.current) return;
         setGraphErrorMessage('Unable to load optimization graph data.');
+        setAlternatePlanSlots(initialAlternateSlots());
       } finally {
-        if (!cancelled) setIsGraphLoading(false);
+        if (loadGen === optimizeLoadGenerationRef.current && !ac.signal.aborted) {
+          setIsGraphLoading(false);
+        }
       }
     };
 
     void loadGraphData();
     return () => {
-      cancelled = true;
+      ac.abort();
     };
   }, []);
-
-  const showConstrainedBar = optimizeData?.hasConstrainedRun ?? false;
-
-  const chartData = useMemo(
-    () => {
-      const mapped =
-        optimizeData?.appliances
-          .map((appliance) => ({
-            label: appliance.name.replaceAll('_', ' '),
-            actualCost: appliance.currentCost,
-            baselineBestCost: appliance.baselineBestCost,
-            constrainedBestCost: appliance.constrainedBestCost,
-          }))
-          .sort((a, b) => {
-            const maxA = showConstrainedBar
-              ? Math.max(a.actualCost, a.baselineBestCost, a.constrainedBestCost)
-              : Math.max(a.actualCost, a.baselineBestCost);
-            const maxB = showConstrainedBar
-              ? Math.max(b.actualCost, b.baselineBestCost, b.constrainedBestCost)
-              : Math.max(b.actualCost, b.baselineBestCost);
-            return maxB - maxA;
-          })
-          .slice(0, 5) ?? [];
-      const maxCost = Math.max(
-        1,
-        ...mapped.map((item) =>
-          showConstrainedBar
-            ? Math.max(item.actualCost, item.baselineBestCost, item.constrainedBestCost)
-            : Math.max(item.actualCost, item.baselineBestCost),
-        ),
-      );
-      const maxBarHeight = 160;
-      const barHeight = (value: number) =>
-        value > 0 ? Math.max(6, (value / maxCost) * maxBarHeight) : 0;
-      return mapped.map((item) => ({
-        label: item.label,
-        actual: barHeight(item.actualCost),
-        baselineBest: barHeight(item.baselineBestCost),
-        constrainedBest: showConstrainedBar ? barHeight(item.constrainedBestCost) : 0,
-        actualCost: item.actualCost,
-        baselineBestCost: item.baselineBestCost,
-        constrainedBestCost: item.constrainedBestCost,
-      }));
-    },
-    [optimizeData, showConstrainedBar],
-  );
 
   const billCycleLabel = useMemo(() => {
     if (!optimizeData?.billCycleStart || !optimizeData.billCycleEnd) return null;
@@ -304,140 +384,100 @@ export function WhoWidget() {
           {title}
         </Typography>
 
-        <Card elevation={0} sx={{ borderRadius: 3 }}>
-          <CardContent sx={{ p: { xs: 2, md: 3 } }}>
-            <Stack spacing={2}>
-              <Stack direction="row" justifyContent="space-between" alignItems="center">
-                <Typography variant="h6" color="text.primary">
-                  Cost by Appliance
-                </Typography>
-                {billCycleLabel ? (
-                  <Typography variant="body2" color="text.secondary">
-                    Billing Cycle: {billCycleLabel}
-                  </Typography>
-                ) : null}
-              </Stack>
+        <CostApplianceChartCard
+          title="Cost by Appliance"
+          billCycleLabel={billCycleLabel}
+          optimizeData={optimizeData}
+          errorMessage={graphErrorMessage}
+        />
 
-              <Stack direction="row" spacing={3} alignItems="flex-end" sx={{ minHeight: 220 }}>
-                <Stack spacing={3} justifyContent="flex-end" sx={{ minWidth: 40, pb: 4 }}>
-                  {['$200', '$100', '$0'].map((label) => (
-                    <Typography key={label} variant="caption" color="text.secondary">
-                      {label}
-                    </Typography>
-                  ))}
-                </Stack>
+        {optimizeData && !graphErrorMessage ? (
+          <Stack alignItems="center" sx={{ pt: 0.5 }}>
+            <Button
+              type="button"
+              variant="contained"
+              onClick={() => setRateComparisonOpen((open) => !open)}
+              aria-expanded={rateComparisonOpen}
+              aria-controls="rate-plan-comparison-panel"
+              id="rate-plan-comparison-toggle"
+              sx={{
+                px: 2.5,
+                py: 1.25,
+                borderRadius: 3,
+                textTransform: 'none',
+                fontWeight: 600,
+                bgcolor: '#5c6bc0',
+                position: 'relative',
+                overflow: 'hidden',
+                animation: 'ratePlanCtaGlow 2.4s ease-in-out infinite',
+                '@keyframes ratePlanCtaGlow': {
+                  '0%, 100%': {
+                    boxShadow: '0 0 0 0 rgba(92, 107, 192, 0.55)',
+                    transform: 'scale(1)',
+                  },
+                  '45%': {
+                    boxShadow: '0 0 0 10px rgba(92, 107, 192, 0)',
+                    transform: 'scale(1.02)',
+                  },
+                },
+                '@media (prefers-reduced-motion: reduce)': {
+                  animation: 'none',
+                  '&::after': { display: 'none' },
+                },
+                '&:hover': {
+                  bgcolor: '#3f51b5',
+                  animation: 'none',
+                  boxShadow: 4,
+                },
+                '&::after': {
+                  content: '""',
+                  position: 'absolute',
+                  inset: 0,
+                  background:
+                    'linear-gradient(105deg, transparent 40%, rgba(255,255,255,0.22) 50%, transparent 60%)',
+                  transform: 'translateX(-100%)',
+                  animation: 'ratePlanShimmer 3.5s ease-in-out infinite',
+                },
+                '@keyframes ratePlanShimmer': {
+                  '0%': { transform: 'translateX(-100%)' },
+                  '18%, 100%': { transform: 'translateX(100%)' },
+                },
+              }}
+            >
+              <Box component="span" sx={{ position: 'relative', zIndex: 1 }}>
+                {rateComparisonOpen ? 'Hide other rate plans' : 'Check savings on other Rate Plan'}
+              </Box>
+            </Button>
+          </Stack>
+        ) : null}
 
-                <Divider orientation="vertical" flexItem />
-
-                <Box
-                  sx={{
-                    flex: 1,
-                    minWidth: 0,
-                    display: 'flex',
-                    flexDirection: { xs: 'column', sm: 'row' },
-                    alignItems: { xs: 'stretch', sm: 'flex-end' },
-                    gap: { xs: 1.5, sm: 2 },
-                  }}
-                >
-                  <Stack
-                    direction="row"
-                    spacing={{ xs: 2, md: 4 }}
-                    alignItems="flex-end"
-                    sx={{ pb: 1, flex: 1, minWidth: 0 }}
-                  >
-                    {chartData.map((item) => (
-                      <Stack key={item.label} spacing={1} alignItems="center" sx={{ maxWidth: 140 }}>
-                        <Stack direction="row" spacing={0.35} alignItems="flex-end" sx={{ height: 160 }}>
-                          <Box
-                            sx={{
-                              width: showConstrainedBar ? 14 : 18,
-                              height: item.actual,
-                              bgcolor: '#1976d2',
-                              borderRadius: 0.5,
-                            }}
-                          />
-                          <Box
-                            sx={{
-                              width: showConstrainedBar ? 14 : 18,
-                              height: item.baselineBest,
-                              bgcolor: '#2e7d32',
-                              borderRadius: 0.5,
-                            }}
-                          />
-                          {showConstrainedBar ? (
-                            <Box
-                              sx={{
-                                width: 14,
-                                height: item.constrainedBest,
-                                bgcolor: '#ed6c02',
-                                borderRadius: 0.5,
-                              }}
-                            />
-                          ) : null}
-                        </Stack>
-                        <Typography variant="caption" color="text.secondary" textAlign="center">
-                          {item.label}
-                        </Typography>
-                        <Typography variant="caption" color="text.secondary" textAlign="center" sx={{ lineHeight: 1.35 }}>
-                          {showConstrainedBar ? (
-                            <>
-                              {formatUsd(item.actualCost)} · {formatUsd(item.baselineBestCost)} ·{' '}
-                              {formatUsd(item.constrainedBestCost)}
-                            </>
-                          ) : (
-                            <>
-                              {formatUsd(item.actualCost)} {'->'} {formatUsd(item.baselineBestCost)}
-                            </>
-                          )}
-                        </Typography>
-                      </Stack>
-                    ))}
-                  </Stack>
-
-                  <Stack
-                    direction="column"
-                    spacing={0.5}
-                    sx={{
-                      flexShrink: 0,
-                      pb: 1,
-                      alignSelf: { xs: 'center', sm: 'flex-end' },
-                      pl: { xs: 0, sm: 2 },
-                      borderLeft: { xs: 'none', sm: (theme) => `1px solid ${theme.palette.divider}` },
-                    }}
-                  >
-                    <Stack direction="row" spacing={2} alignItems="center" sx={{ flexWrap: 'wrap', gap: 1 }}>
-                      <Stack direction="row" spacing={1} alignItems="center">
-                        <Box sx={{ width: 12, height: 12, bgcolor: '#1976d2', flexShrink: 0 }} />
-                        <Typography variant="body2" color="text.secondary">
-                          Actual
-                        </Typography>
-                      </Stack>
-                      <Stack direction="row" spacing={1} alignItems="center">
-                        <Box sx={{ width: 12, height: 12, bgcolor: '#2e7d32', flexShrink: 0 }} />
-                        <Typography variant="body2" color="text.secondary">
-                          Best
-                        </Typography>
-                      </Stack>
-                      {showConstrainedBar ? (
-                        <Stack direction="row" spacing={1} alignItems="center">
-                          <Box sx={{ width: 12, height: 12, bgcolor: '#ed6c02', flexShrink: 0 }} />
-                          <Typography variant="body2" color="text.secondary">
-                            Constrained
-                          </Typography>
-                        </Stack>
-                      ) : null}
-                    </Stack>
-                  </Stack>
-                </Box>
-              </Stack>
-            </Stack>
-            {graphErrorMessage ? (
-              <Typography variant="caption" color="error.main">
-                {graphErrorMessage}
-              </Typography>
-            ) : null}
-          </CardContent>
-        </Card>
+        <Collapse in={rateComparisonOpen} timeout="auto">
+          <Stack
+            spacing={2}
+            sx={{ pt: 2 }}
+            id="rate-plan-comparison-panel"
+            role="region"
+            aria-labelledby="rate-plan-comparison-toggle"
+          >
+            <Typography variant="body2" color="text.secondary" textAlign="center">
+              Same usage and constraints as above; bars use each plan&apos;s rates ({COMPARISON_RATE_PLANS.map((id) => ratePlanDisplayName(id)).join(', ')}).
+            </Typography>
+            {optimizeData && !graphErrorMessage
+              ? alternatePlanSlots
+                  .filter((slot) => COMPARISON_PLAN_SET.has(slot.ratePlan))
+                  .map((slot) => (
+                    <CostApplianceChartCard
+                      key={slot.ratePlan}
+                      title={`Cost by appliance — ${ratePlanDisplayName(slot.ratePlan)}`}
+                      optimizeData={slot.status === 'ok' ? slot.data : null}
+                      inlineLoading={slot.status === 'loading'}
+                      errorMessage={slot.status === 'error' ? slot.error : null}
+                      compact
+                    />
+                  ))
+              : null}
+          </Stack>
+        </Collapse>
 
         <Stack spacing={0.5}>
             <Typography variant="subtitle2" color="text.secondary">
@@ -655,6 +695,7 @@ export function WhoWidget() {
             </Stack>
           </CardContent>
         </Card>
+
       </Stack>
     </Paper>
   );
